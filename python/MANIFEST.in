@@ -1,0 +1,4 @@
+include README
+recursive-include pyarcan *
+recursive-exclude pyarcan *.pyc
+recursive-exclude examples *
