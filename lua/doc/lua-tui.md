@@ -1,12 +1,9 @@
-# Arcan-TUI - lua Binding => attrtbls
+# Arcan-TUI - Lua API
 
 # Introduction
 
 These bindings expose the Arcan TUI API for creating text oriented
-user-interfaces. This document merely describes the Lua exposed functions, not
-how to embed the bindings into other projects. For that, in-source embed
-the arcan/src/shmif/tui/tui\_lua.c implementation and call tui\_lua\_expose
-on the context.
+user-interfaces. They are provided as normal Lua-Rocks.
 
 # Setting up a connection
 
@@ -21,7 +18,7 @@ edited, the current path for a shell and so on.
 When the function call returns, you either have a connection represented by the
 context table, or nil as an indication of failure.
 
-The API is alsmost exclusively event-driven, the handler table supports a number
+The API is almost exclusively event-driven, the handler table supports a number
 of entry points you can match to functions. The simplest pattern is thus:
 
     context = tui_open("", "")
@@ -57,7 +54,8 @@ and presenting it interactively without forcing in additional dependencies.
 
 When finished working with a context, you deallocate it by calling the method
 _close_ which takes an optional "last\_words" string that may tell the user
-*why* you decided to close.
+*why* you decided to close. This is to communicate an error, in a normal path
+it should be left empty.
 
 # Drawing
 
@@ -127,29 +125,32 @@ The accepted fields in \_table\_ are as follows:
     bg : integer (0..255)
     bb : integer (0..255)
     id : integer
+		fg_id : integer
+		bg_id : integer
     shape_break : integer
 
 All of these, except for id and shape\_break, directly control the text drawing
 routine. Id is a custom number tag that can be used to associate with
 application specific metadata, as a way of mapping to more complex types.
 
+If the color\_id field is set, it is expected to use a value from the builtin
+table tui\_colors.
+
 Shape break is used to control text hinting engines for non-monospace
 rendering. Though this goes against the traditional cell-grid structure, it is
 useful for internationalisation and for ligature substitutions (where a
-specific sequence of characters may map to an entirely different
-representation.
+specific sequence of characters may map to an entirely different representation
+and you want subsequent cells to break word or other group selections. For
+shaped rendering, this might also cause realignment to the grid.
 
 ## Colors
 
 There is an event handler with the name 'recolor' which provides no arguments.
-When activated, this indicates that the server provided palette have
-changed. Though you explicitly set linear 8-bit rgb values to indicate color,
-these _should_ be taken from a table of semantic indices.
+When activated, this indicates that the desired palette has changed.
 
-There are two context- relative accessor functions for the palette:
-
-    get_color(index) => r, g, b
-    set_color(index, r, g, b)
+If you have been using the 'color\_id' method, when setting cell attributes,
+you can ignore this handler. If you use custom colors however, you will want to
+pick colors that match the
 
 The possible values for index are provided in the global lookup table
 'tui\_color' and are thus accessed like:
@@ -332,12 +333,12 @@ to spawn a detachable process.
 A lot of the work involved is retrieving and reacting to inputs from the user.
 The following input event handlers are present:
 
-    utf8 (char) : bool
+    utf8 (string) : bool
     key (subid, keysym, scancode, modifiers)
     mouse_motion (relative, x, y, modifiers)
     mouse_button (subid, x, y, modifiers)
-    label() : bool
-    alabel()
+    label(string) : bool
+    alabel(string)
     query_label() : bool
 
 Some of these act as a chain with an early out and flow from a high-level of
