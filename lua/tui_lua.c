@@ -99,8 +99,8 @@ static lua_Number luaL_optbnumber(lua_State* L, int narg, lua_Number opt)
 static bool on_label(struct tui_context* T, const char* label, bool act, void* t)
 {
 	SETUP_HREF("label", false);
-	lua_pushboolean(L, act);
-	lua_call(L, 3, 1);
+	lua_pushstring(L, label);
+	lua_call(L, 2, 1);
 	lua_pop(L, 1);
 	END_HREF;
 	return false;
@@ -496,7 +496,7 @@ static int tui_attr(lua_State* L)
 
 /* use context as base for color lookup */
 	if (lua_type(L, ci) == LUA_TUSERDATA){
-		struct tui_lmeta* ib = luaL_checkudata(L, ci++, "tui_main");
+		struct tui_lmeta* ib = luaL_checkudata(L, ci++, TUI_METATABLE);
 		arcan_tui_get_color(ib->tui, TUI_COL_PRIMARY, attr.fc);
 		arcan_tui_get_color(ib->tui, TUI_COL_BG, attr.bc);
 	}
@@ -590,31 +590,10 @@ static int wnd_scroll(lua_State* L)
 	return 0;
 }
 
-static int reset_tabs(lua_State* L)
-{
-	TUI_UDATA;
-	arcan_tui_reset_all_tabstops(ib->tui);
-	return 0;
-}
-
 static int scrollhint(lua_State* L)
 {
 	TUI_UDATA;
 /* MISSING */
-	return 0;
-}
-
-static int cursor_tab(lua_State* L)
-{
-	TUI_UDATA;
-	int tabs = 1;
-	if (lua_type(L, 2) == LUA_TNUMBER){
-		tabs = lua_tonumber(L, 2);
-	}
-	if (tabs > 0)
-		arcan_tui_tab_right(ib->tui, tabs);
-	else
-		arcan_tui_tab_left(ib->tui, -tabs);
 	return 0;
 }
 
@@ -646,15 +625,6 @@ static int cursor_stepcol(lua_State* L)
 	else
 		arcan_tui_move_right(ib->tui, n);
 
-	return 0;
-}
-
-static int screen_margins(lua_State* L)
-{
-	TUI_UDATA;
-	int top = luaL_checknumber(L, 2);
-	int bottom = luaL_checknumber(L, 3);
-	arcan_tui_set_margins(ib->tui, top, bottom);
 	return 0;
 }
 
@@ -692,42 +662,11 @@ static int erase_region(lua_State* L)
 	return 0;
 }
 
-static int erase_line(lua_State* L)
-{
-	TUI_UDATA;
-	bool prot = luaL_optbnumber(L, 2, false);
-	arcan_tui_erase_current_line(ib->tui, prot);
-	return 0;
-}
-
 static int erase_screen(lua_State* L)
 {
 	TUI_UDATA;
 	bool prot = luaL_optbnumber(L, 2, false);
 	arcan_tui_erase_screen(ib->tui, prot);
-	return 0;
-}
-
-static int erase_scrollback(lua_State* L)
-{
-	TUI_UDATA;
-	arcan_tui_erase_sb(ib->tui);
-	return 0;
-}
-
-static int erase_home_to_cursor(lua_State* L)
-{
-	TUI_UDATA;
-	bool prot = luaL_optbnumber(L, 2, false);
-	arcan_tui_erase_home_to_cursor(ib->tui, prot);
-	return 0;
-}
-
-static int erase_cursor_screen(lua_State* L)
-{
-	TUI_UDATA;
-	bool prot = luaL_optbnumber(L, 2, false);
-	arcan_tui_erase_cursor_to_screen(ib->tui, prot);
 	return 0;
 }
 
@@ -754,6 +693,7 @@ static int tui_open(lua_State* L)
 	if (!meta){
 		return 0;
 	}
+	*meta = (struct tui_lmeta){0};
 
 	arcan_tui_conn* conn = arcan_tui_open_display(title, ident);
 /* will be GCd */
@@ -852,7 +792,7 @@ static int tuiclose(lua_State* L)
 
 static int collect(lua_State* L)
 {
-	struct tui_lmeta* ib = luaL_checkudata(L, 1, "tui_main");
+	struct tui_lmeta* ib = luaL_checkudata(L, 1, TUI_METATABLE);
 	if (!ib)
 		return 0;
 
@@ -1079,11 +1019,6 @@ static int color_set(lua_State* L)
 
 #undef TUI_UDATA
 
-/*
- * constants needed:
- *  - screen mode
- */
-
 static int
 apiversion(lua_State *L)
 {
@@ -1147,24 +1082,10 @@ luaopen_arcantui(lua_State* L)
 		{"to_clipboard", setcopy},
 		{"cursor_pos", getcursor},
 		{"new_window", reqwnd},
-		{"set_tabstop", set_tabstop},
-		{"insert_lines", insert_lines},
-		{"delete_lines", delete_lines},
-		{"insert_empty", insert_chars},
-		{"erase_cells", delete_chars},
-		{"erase_current_line", erase_line},
-		{"erase_screen", erase_screen},
-		{"erase_cursor_to_screen", erase_cursor_screen},
-		{"erase_home_to_cursor", erase_home_to_cursor},
-		{"erase_scrollback", erase_scrollback},
-		{"erase_region", erase_region},
+		{"erase", erase_screen},
 		{"scroll", wnd_scroll},
 		{"scrollhint", scrollhint},
-		{"cursor_tab", cursor_tab},
 		{"cursor_to", cursor_to},
-		{"cursor_step_col", cursor_stepcol},
-		{"cursor_step_row", cursor_steprow},
-		{"set_margins", screen_margins},
 		{"dimensions", screen_dimensions},
 		{"invalidate", invalidate},
 		{"close", tuiclose},
@@ -1200,13 +1121,13 @@ luaopen_arcantui(lua_State* L)
 		{"alternate", TUI_ALTERNATE}
 	};
 
+	lua_pushliteral(L, "flags");
 	lua_newtable(L);
 	for (size_t i = 0; i < COUNT_OF(flagtbl); i++){
 		lua_pushstring(L, flagtbl[i].key);
 		lua_pushnumber(L, flagtbl[i].val);
 		lua_rawset(L, -3);
 	}
-	lua_pushliteral(L, "flags");
 	lua_settable(L, -3);
 
 	struct { const char* key; int val; } coltbl[] = {
@@ -1224,13 +1145,13 @@ luaopen_arcantui(lua_State* L)
 	{"inactive", TUI_COL_INACTIVE},
 	{"reference", TUI_COL_REFERENCE}
 	};
+	lua_pushliteral(L, "colors");
 	lua_newtable(L);
 	for (size_t i = 0; i < COUNT_OF(coltbl); i++){
 		lua_pushstring(L, coltbl[i].key);
 		lua_pushnumber(L, coltbl[i].val);
 		lua_rawset(L, -3);
 	}
-	lua_pushliteral(L, "colors");
 	lua_settable(L, -3);
 
 	struct { const char* key; int val; } symtbl[] = {
@@ -1371,6 +1292,7 @@ luaopen_arcantui(lua_State* L)
 	};
 
 /* push the keyboard symbol table as both b = a and a = b */
+	lua_pushliteral(L, "keys");
 	lua_newtable(L);
 	for (size_t i = 0; i < COUNT_OF(symtbl); i++){
 		lua_pushstring(L, &symtbl[i].key[5]);
@@ -1380,7 +1302,6 @@ luaopen_arcantui(lua_State* L)
 		lua_pushstring(L, &symtbl[i].key[5]);
 		lua_rawset(L, -3);
 	}
-	lua_pushliteral(L, "keys");
 	lua_settable(L, -3);
 
 	return 1;
