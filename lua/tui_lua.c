@@ -6,20 +6,18 @@
  * able to open/connect using tui_open() -> context.
  *
  * TODO:
- *   [ ] Move to work as a normal 'luarocks' entry.
- *   [ ] Synch to upstream changes
- *       [ ] bitmask for attributes
- *       [ ] color indexes
+ *   [ ] label querying
+ *   [ ] Handover exec
+ *   [ ] State size
+ *   [ ] Progress
+ *   [ ] Scrollhint
  *   [ ] Add bufferwnd/listwnd
  *   [ ] Character conversion helpers
  *   [ ] Hasglyph
- *   [ ] label querying
- *   [ ] remove the 'to deprecate' line / tab / reflow / scrollback / ...
- *
- *   [ ] transition to widgets (bufferwnd, listwnd, ...)
- *
- *   arcan_tui_message( TUI_MESSAGE_PROMPT, ALERT, NOTIFICATION, FAILURE )
- *   arcan_tui_progress( PROGRESS_INTERNAL, BCHUNK_IN, BCHUNK_OUT, STATE_IN, STATE_OUT )
+ *   [ ] Window hint
+ *   [ ] multiple windows
+ *   [ ] background copy
+ *   [ ] handover media embed
  */
 
 #include <arcan_shmif.h>
@@ -638,13 +636,6 @@ static int screen_dimensions(lua_State* L)
 	return 2;
 }
 
-static int invalidate(lua_State* L)
-{
-	TUI_UDATA;
-	arcan_tui_invalidate(ib->tui);
-	return 0;
-}
-
 static int erase_region(lua_State* L)
 {
 	TUI_UDATA;
@@ -1017,6 +1008,45 @@ static int color_set(lua_State* L)
 	return 0;
 }
 
+static int alert(lua_State* L)
+{
+	TUI_UDATA;
+	arcan_tui_message(ib->tui, TUI_MESSAGE_ALERT, luaL_checkstring(L, 2));
+	return 0;
+}
+
+static int notification(lua_State* L)
+{
+	TUI_UDATA;
+	arcan_tui_message(ib->tui, TUI_MESSAGE_NOTIFICATION, luaL_checkstring(L, 2));
+	return 0;
+}
+
+static int failure(lua_State* L)
+{
+	TUI_UDATA;
+	arcan_tui_message(ib->tui, TUI_MESSAGE_FAILURE, luaL_checkstring(L, 2));
+	return 0;
+}
+
+static int announce_io(lua_State* L)
+{
+	TUI_UDATA;
+	const char* input = luaL_optstring(L, 2, "");
+	const char* output = luaL_optstring(L, 3, "");
+	arcan_tui_announce_io(ib->tui, false, input, output);
+	return 0;
+}
+
+static int request_io(lua_State* L)
+{
+	TUI_UDATA;
+	const char* input = luaL_optstring(L, 2, "");
+	const char* output = luaL_optstring(L, 3, "");
+	arcan_tui_announce_io(ib->tui, true, input, output);
+	return 0;
+}
+
 #undef TUI_UDATA
 
 static int
@@ -1075,27 +1105,31 @@ luaopen_arcantui(lua_State* L)
 		{"write", writeu8},
 		{"write_to", write_tou8},
 		{"set_handlers", settbl},
-		{"update_ident", setident},
+		{"update_identity", setident},
 		{"mouse_forward", setmouse},
-		{"set_default_attr", defattr},
+		{"set_default", defattr},
 		{"reset", reset},
 		{"to_clipboard", setcopy},
 		{"cursor_pos", getcursor},
 		{"new_window", reqwnd},
 		{"erase", erase_screen},
+		{"erase_region", erase_region},
 		{"scroll", wnd_scroll},
 		{"scrollhint", scrollhint},
 		{"cursor_to", cursor_to},
 		{"dimensions", screen_dimensions},
-		{"invalidate", invalidate},
 		{"close", tuiclose},
 		{"get_color", color_get},
 		{"set_color", color_set},
 		{"set_flags", set_flags},
+		{"announce_io", announce_io},
+		{"request_io", request_io},
+		{"alert", alert},
+		{"notification", notification},
+		{"failure", failure},
 /* MISSING:
  *    getxy,
  *    writestr,
- *    printf
  */
 	};
 
