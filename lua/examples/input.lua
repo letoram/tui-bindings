@@ -5,22 +5,17 @@ local wnd
 
 local offset = 1
 
-local function draw()
--- erase,
--- cursor to ..
-end
-
-local function add_str(str)
-	msg = msg .. str
-	draw()
-end
+-- see query_label below
+local labels =
+{
+	{"TEST", "A custom input for testing", tui.keys.A, tui.modifiers.SHIFT, "A"}
+}
 
 -- note that most events only trigger on rising edge (press)
 wnd =
 tui.open("input", "", {
 	handlers =
 	{
-
 -- return state determines if the input will be consumed and continue
 -- on as a key event (see below)
 	label =
@@ -41,6 +36,28 @@ tui.open("input", "", {
 	mouse_button =
 		function(self, x, y, index, active, mods)
 			print("mouse button", x, y, index, active, mods)
+		end,
+
+-- this can be called at any time to figure out if you export any custom
+-- inputs. returns name, description (matching country, language if possible)
+-- and if the input is analog or digital.
+--
+-- the matching 'name' will be sent to the label or alabel (analog)
+-- above when the user wants to trigger it. These should be kept modest
+-- in length, ~at most 100 or so but really 5-10 makes more UI sense.
+--
+-- querying will stop at the first index that returns nil, otherwise the
+-- expected returns are:
+-- 'label', 'description', default_key (or 0), default_modifier (or 0)
+-- and 'v-sym' (single utf8 encoded codepoint for icon identifier.
+--
+-- Only the 'label' is obligatory in this case.
+--
+	query_label =
+		function(self, index, country, language)
+			if labels[index] then
+				return unpack(labels[index])
+			end
 		end,
 
 -- key input that resolve to a 'translated' input, [str] is a single
@@ -70,8 +87,6 @@ tui.open("input", "", {
 )
 
 assert(wnd, "tui:open failed")
-print(tui, tui.keys, tui.flags)
-for k,v in pairs(tui) do print(k,v); end
 
 while (wnd:process()) do
 	wnd:refresh()

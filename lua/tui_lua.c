@@ -6,16 +6,15 @@
  * able to open/connect using tui_open() -> context.
  *
  * TODO:
- *   [ ] label querying
- *   [ ] Handover exec
  *   [ ] State size
+ *   [ ] Add bufferwnd/listwnd
+ *   [ ] Handover exec
+ *   [ ] multiple windows
  *   [ ] Progress
  *   [ ] Scrollhint
- *   [ ] Add bufferwnd/listwnd
  *   [ ] Character conversion helpers
  *   [ ] Hasglyph
  *   [ ] Window hint
- *   [ ] multiple windows
  *   [ ] background copy
  *   [ ] handover media embed
  */
@@ -26,6 +25,7 @@
 #include <arcan_tui_linewnd.h>
 #include <arcan_tui_readline.h>
 
+#include <stdbool.h>
 #include <lua.h>
 #include <lauxlib.h>
 #include <lualib.h>
@@ -59,6 +59,33 @@ static struct tui_cbcfg shared_cbcfg = {};
 	lua_pushvalue(L, -3);
 
 #define END_HREF lua_pop(L, 1);
+
+static void dump_stack(lua_State* ctx)
+{
+	int top = lua_gettop(ctx);
+	fprintf(stderr, "-- stack dump (%d)--\n", top);
+
+	for (size_t i = 1; i <= top; i++){
+		int t = lua_type(ctx, i);
+
+		switch (t){
+		case LUA_TBOOLEAN:
+			fprintf(stderr, lua_toboolean(ctx, i) ? "true" : "false");
+		break;
+		case LUA_TSTRING:
+			fprintf(stderr, "%d\t'%s'\n", i, lua_tostring(ctx, i));
+			break;
+		case LUA_TNUMBER:
+			fprintf(stderr, "%d\t%g\n", i, lua_tonumber(ctx, i));
+			break;
+		default:
+			fprintf(stderr, "%d\t%s\n", i, lua_typename(ctx, t));
+			break;
+		}
+	}
+
+	fprintf(stderr, "\n");
+}
 
 /*
  * convenience macro prolog for all TUI window bound lua->c functions
@@ -99,7 +126,6 @@ static bool on_label(struct tui_context* T, const char* label, bool act, void* t
 	SETUP_HREF("label", false);
 	lua_pushstring(L, label);
 	lua_call(L, 2, 1);
-	lua_pop(L, 1);
 	END_HREF;
 	return false;
 }
@@ -114,15 +140,8 @@ static bool on_u8(struct tui_context* T, const char* u8, size_t len, void* t)
 			rv = lua_tonumber(L, -1);
 		else if (lua_isboolean(L, -1))
 			rv = lua_toboolean(L, -1);
-		lua_pop(L, 1);
 	END_HREF;
 	return rv;
-}
-
-static bool on_alabel(struct tui_context* T, const char* label,
-		const int16_t* smpls, size_t n, bool rel, uint8_t datatype, void* t)
-{
-	return false;
 }
 
 static void on_mouse(struct tui_context* T,
@@ -186,17 +205,10 @@ static void on_state(struct tui_context* T, bool input, int fd, void* t)
 {
 	SETUP_HREF( (input?"state_in":"state_out"), );
 
-	int fd2 = arcan_shmif_dupfd(fd, -1, true);
-	if (-1 == fd2){
-		lua_pop(L, 1);
-		END_HREF;
-		return;
-	}
-
 	FILE** pf = (FILE**) lua_newuserdata(L, sizeof(FILE*));
 	luaL_getmetatable(L, LUA_FILEHANDLE);
 	lua_setmetatable(L, -2);
-	*pf = fdopen(fd2, input ? "r" : "w");
+	*pf = fdopen(fd, input ? "r" : "w");
 	lua_call(L, 2, 0);
 
 	END_HREF;
@@ -205,7 +217,16 @@ static void on_state(struct tui_context* T, bool input, int fd, void* t)
 static void on_bchunk(struct tui_context* T,
 	bool input, uint64_t size, int fd, const char* type, void* t)
 {
-/* same as on_state */
+	SETUP_HREF((input ?"bchunk_in":"bchunk_out"), );
+
+	FILE** pf = (FILE**) lua_newuserdata(L, sizeof(FILE*));
+	luaL_getmetatable(L, LUA_FILEHANDLE);
+	lua_setmetatable(L, -2);
+	*pf = fdopen(fd, input ? "r" : "w");
+	lua_pushstring(L, type);
+	lua_call(L, 3, 0);
+
+	END_HREF;
 }
 
 static void on_vpaste(struct tui_context* T,
@@ -320,14 +341,36 @@ static bool query_label(struct tui_context* T,
 	struct tui_labelent* dstlbl, void* t)
 {
 	SETUP_HREF("query_label", false);
+	lua_pushnumber(L, ind+1);
+	lua_pushstring(L, country);
+	lua_pushstring(L, lang);
+	lua_call(L, 4, 5);
+
+	const char* msg = luaL_optstring(L, -5, NULL);
+	const char* descr = luaL_optstring(L, -4, NULL);
+
+	bool gotrep = msg != NULL;
+	if (gotrep){
+		snprintf(dstlbl->label, COUNT_OF(dstlbl->label), "%s", msg);
+		snprintf(dstlbl->descr, COUNT_OF(dstlbl->descr), "%s", descr ? descr : "");
+		dstlbl->initial = luaL_optnumber(L, -3, 0);
+		dstlbl->modifiers = luaL_optnumber(L, -2, 0);
+		const char* vsym = luaL_optstring(L, -1, NULL);
+		if (vsym){
+			snprintf(dstlbl->vsym, COUNT_OF(dstlbl->vsym), "%s", vsym);
+		}
+
+		dstlbl->idatatype = 0; /* only support buttons for now */
+	}
+	lua_pop(L, 5);
 
 /*
  * MISSING:
  * lcall with country/lang, expect multi-return with label, descr
  * and fill in - if no arguments returned
  */
-	return false;
 	END_HREF;
+	return gotrep;
 }
 
 static void on_geohint(struct tui_context* T, float lat,
@@ -707,7 +750,6 @@ static int tui_open(lua_State* L)
 	shared_cbcfg = (struct tui_cbcfg){
 		.query_label = query_label,
 		.input_label = on_label,
-		.input_alabel = on_alabel,
 		.input_mouse_motion = on_mouse,
 		.input_mouse_button = on_mouse_button,
 		.input_utf8 = on_u8,
@@ -1334,6 +1376,31 @@ luaopen_arcantui(lua_State* L)
 		lua_rawset(L, -3);
 		lua_pushnumber(L, symtbl[i].val);
 		lua_pushstring(L, &symtbl[i].key[5]);
+		lua_rawset(L, -3);
+	}
+	lua_settable(L, -3);
+
+	struct { const char* key; int val; } modtbl[] = {
+		{"LSHIFT", TUIM_LSHIFT},
+		{"RSHIFT", TUIM_RSHIFT},
+		{"SHIFT", TUIM_LSHIFT | TUIM_RSHIFT},
+		{"LCTRL", TUIM_LCTRL},
+		{"RCTRL", TUIM_RCTRL},
+		{"CTRL", TUIM_LCTRL | TUIM_RCTRL},
+		{"LALT", TUIM_LALT},
+		{"RALT", TUIM_RALT},
+		{"ALT", TUIM_LALT | TUIM_RALT},
+		{"LMETA", TUIM_LMETA},
+		{"RMETA", TUIM_RMETA},
+		{"META", TUIM_LMETA | TUIM_RMETA},
+		{"REPEAT", TUIM_REPEAT}
+	};
+
+  lua_pushliteral(L, "modifiers");
+	lua_newtable(L);
+	for (size_t i = 0; i < COUNT_OF(modtbl); i++){
+		lua_pushstring(L, modtbl[i].key);
+		lua_pushnumber(L, modtbl[i].val);
 		lua_rawset(L, -3);
 	}
 	lua_settable(L, -3);
