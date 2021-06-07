@@ -3,13 +3,18 @@
 # Introduction
 
 These bindings expose the Arcan TUI API for creating text oriented
-user-interfaces. They are provided as normal Lua-Rocks.
+user-interfaces. They are provided as normal Lua-Rocks compatible modules for
+Lua 5.1 and above.
+
+See the 'examples' folder for documented examples on the available features
+and their recommended use.
 
 # Setting up a connection
 
 You create a new connection with the following function:
 
-    tui_open(title_string, identity_string, (handler_table)) => context_table
+    tui = require('arcantui')
+		tui:open(title_string, identity_string, (option_table)) => context_table
 
 The title string is the immutable title of your application, while-as the
 identity string can reflect some dynamic state, e.g. the name of a file being
@@ -18,25 +23,44 @@ edited, the current path for a shell and so on.
 When the function call returns, you either have a connection represented by the
 context table, or nil as an indication of failure.
 
+The (option\_table) carries additional configuration for how the window is
+supposed to behave. The main key in that table should be 'handlers' with the
+event handlers that the context should have currently. These can be swapped out
+via a call to 'set\_handlers', and intercepted/overloaded by high-level
+widgets.
+
 The API is almost exclusively event-driven, the handler table supports a number
 of entry points you can match to functions. The simplest pattern is thus:
 
-    context = tui_open("", "")
+    all_contexts = {context}
+
     while context:process() do
+        for i=#all_contexts,1,-1 do do
+			    all_contexts[i]:refresh()
+				end
     end
+
+Process will flush event queues and run handlers for all contexts tied to a
+primary one (your connection), while refresh will only synch changes to the
+canvas for each context it is invoked on. The reason for the split is that
+there is likely other actions you might want to take, e.g. processing data from
+an external source, that would affect the current output.
+
+The reason for the 'reverse' refresh order here is to safeguard against event
+handlers that would :close a context in response to the user closing a window
+or a window becoming useless (completion popups and so on), and remove any
+existing tracking references (e.g. table.remove(tbl, context\_index).
 
 If the identity part has changed, due to the program opening some document
 or external connection or something else that would distinguish it from other
 instances of the same program, this can be updated with:
 
-    context:update_ident("myfile.pdf")
+    context:update_identity("myfile.pdf")
 
-The acccepted prototype for the process method looks like this:
+The acccepted prototypes for the process method looks like this:
 
     process(ctx) => bool
     process(ctx, timeout) => bool
-    process(ctx, descriptor_table) => bool, state_table
-    process(ctx, descriptor_table, timeout) => bool, state_table
 
 If process ever returns 'false' it implies that the connection has died for
 some user- or server- initiated reason. If there are any subwindows mapped
@@ -60,15 +84,7 @@ it should be left empty.
 # Drawing
 
 Drawing in the TUI API means picking 'attributes' one or several unicode
-characters and writing them to a location. The process is simply that you
-prepare all the changes you want to make, apply them using the appropriate
-functions from the list below, and when you are finished, commit by calling
-the 'refresh' method on the context. This will block processing until the
-point where the server side has accepted your changes.
-
-The 'location' is a cell on a rectangular grid, referenced using 'rows' (y
-axis) and columns (x axis), thoough some functions take coordinates in x and y
-format.
+characters and writing them to a location.
 
     mycontext:dimensions() => w, h
 
@@ -79,17 +95,8 @@ be written to unless the draw call used explicitly manipulates the cursor.
 
     write
     write_to
-    insert_lines
-    delete_lines
-    insert_empty
-    erase_cells
-    erase_current_line
-    erase_screen
-    erase_cursor_to_screen
-    erase_home_to_cursor
-    erase_scrollback
+    erase
     erase_region
-    invalidate - force redraw the entire screen on next refresh
 
 For any drawing, positioning and sizing operation - make special note if the
 source call specifies an x,y position coordinate with 0,0 origo in the upper
@@ -103,7 +110,7 @@ specified explicitly or implicitly by setting a default attribute.
 
 The default attribute can be set and retreived via:
 
-    set_default_attr(attrtbl) => attrtbl
+    set_default(attrtbl) => attrtbl
 
 The attrtbl argument can be constructed via the global function:
 
@@ -134,7 +141,7 @@ routine. Id is a custom number tag that can be used to associate with
 application specific metadata, as a way of mapping to more complex types.
 
 If the color\_id field is set, it is expected to use a value from the builtin
-table tui\_colors.
+table 'colors'.
 
 Shape break is used to control text hinting engines for non-monospace
 rendering. Though this goes against the traditional cell-grid structure, it is
@@ -150,16 +157,16 @@ When activated, this indicates that the desired palette has changed.
 
 If you have been using the 'color\_id' method, when setting cell attributes,
 you can ignore this handler. If you use custom colors however, you will want to
-pick colors that match the
+pick colors that match the primary, secondary, background colors.
 
 The possible values for index are provided in the global lookup table
-'tui\_color' and are thus accessed like:
+'colors' and are thus accessed like:
 
     attrtbl.fr, attrtbl.fg, attrtbl.fb = get_color(tui_color.label)
     attrtbl.br, attrtbl.bg, attrtbl.bb = get_color(tui_color.background)
     set_default_attr(attrtbl)
 
-The available semantic labels in the global tui\_color table are:
+The available semantic labels in the module-global tui\_color table are:
 
     text - expected color for generic 'text'
     background - expected color to match text background
@@ -176,10 +183,14 @@ The available semantic labels in the global tui\_color table are:
     cursor - the currently set color of the cursor, this is handled internally
     altcursor - the currently set color in alt- scrolling mode, this is handled
                 internally
+    reference - navigation links and data references
+		ui - user-interface elements like statusbars
 
 Note that it is your responsibility to update on recolor events, the backend
 does not track the semantic label associated with some cell. This is one of the
 reasons you have access to a custom-set id as cell attribute.
+
+After 'ui', the legacy ansi color palette starts.
 
 ## Cursor Control
 
@@ -363,14 +374,13 @@ triggered.
 For working with raw key inputs, you have a number of options in the key event
 handler, but the most important is likely the subid and the modifiers combined.
 
-To decode some meaning out of subid, you have a global table called 'tuik'
-which can translate both from a textual representation of a key to a numeric,
-and from a numeric to a textual one.
+The module-global table 'keys' has a bidirectional mapping between symbol
+names (keysym) and their numeric form, e.g. tui.keys.F1.
 
 ## Labels
 
 As a response to a change in language settings or at the initial startup, the
-'query\_label' callback will be invoked. A label is a string tag that takes
+'query\_label' handler will be invoked. A label is a string tag that takes
 priority over other forms of inputs, and comes with a user targeted short
 description about its use, along with information about its suggested default
 symbol and modifier binding. This is provided as a means of making the physical
@@ -414,7 +424,9 @@ delivered to your set of event handlers.
 # Data Transfers
 
 Another part of expected application behavior is to deal with anciliary data
-transfers, where the more common one is the more familiar, the clipboard.
+transfers, where the more common one is the clipboard. There are also 'bchunk'
+(blog data transfers) and state which is a contract where the client should
+be able to export/import current settings so the user can resume previous work.
 
 ## State-in/State-out
 
@@ -429,7 +441,8 @@ The outer display system is then free, at any time, to provide an event to a
 state\_in event handler or a state\_out event handler, expecting you to
 pack/unpack enough state to be able to revert to an earlier state.
 Implementing this properly unlocks a number of desired features, e.g. device
-mobility, crash recovery, data mobility and so on.
+mobility, crash recovery, data mobility and so on. For how to deal with the
+data in a state\_in/out handler, see bchunk below.
 
 You can also disable the feature after enabling it by setting the size to 0.
 
@@ -447,23 +460,40 @@ Three event handlers deal with clipboard contents. Those are:
 
 Where the most common one, paste, is similar to a bounded set of utf8 inputs.
 
-Bchunk comes as a generic 'here is a stream of bytes, do something with it',
-possible as a response to an announcement that your application understands
-a certain extension pattern:
+## Bchunk
 
-    mycontext:bchunk_support({"png", "bmp"}, {"png, bmp"})
+Bchunk or 'blob' transfers,  come as a generic 'here is a stream of bytes,
+do something with it', possible as a response to an announcement that your
+application understands a certain extension pattern:
 
-These are to be understood as convenience features for the outer display system
-to integrate with some kind of data import/export path (like a file manager).
-The decision to opt for an extension rather than some MIME-like notion of type
-is simply the stance that it is always dangerous to believe or assume that a
-a metadata type tag authenticates its data, integrity and origin. Parsers should
-always assume broken data first, and respond aggressively - in contrast to the
-often adopted doctrine of 'Postel's Principle'.
+    mycontext:announce_io("png;bmp", "png")
 
-vpaste and apaste are special as they also need to be bundled with functions
-that can encode/decode/present this data - unless your application has specific
-provisions for it already.
+This would tell the other end that this context support arbitrary opening
+'png' and 'bmp' files, and saving to 'png' ones. The user can invoke this
+via any implementation defined means exist on their end.
+
+    mycontext:request_io(nil, "*")
+
+This would tell the other end that we would really like the user to be queried
+for something to store with any kind of type. This is still not guaranteed to
+be honored.
+
+This assumes that you also provide an bchunk\_in, bchunk\_out handler.
+Both of these have the prototype:
+
+    bchunk_in(self, blob, id)
+
+The blob is a user-data that can be used in a few ways. Internally it
+encapsulates a file descriptor wrapped around some buffering. For input,
+you can use 'data\_handler' to assign a callback that will receive buffers
+as they arrive. This is handled as part of the 'process' call.
+
+For bchunk\_out the 'data\_handler' can also take a string buffer itself,
+and sending / closing / management will be handled internally entirely.
+
+These methods are preferredas they are asynchronous and non-blocking. If you
+want, you can call the 'lua\_file' method on the blob that will transform it
+into a normal Lua 'file' type metatable, with all the caveats that entail.
 
 # System
 
@@ -481,11 +511,28 @@ state, where the level of severity (number argument) goes from:
 3. Crash-recovery, system-state lost.
 
 The third level is also used if the underlying display system has been remapped
-to some other device, local or non-local.
+to some other device, local or non-local. The normal tactic is to trigger
+whatever 'redraw from clean slate' function you might have, as well as to re-
+announce any supported input/output formats.
+
+You can also call 'reset' on a context, but this has the effect of undoing other
+hints on bchunk, state and input\_labels.
+
+## Exec-State
+
+The 'exec\_state' event handler indicates if the context is changing from
+'normal' to being suspended or 'terminating'. The later is mainly important for
+subwindows where a window might be destroyed, but others keep on living.
+
+The suspend state is an indicator that calls to refresh and similar ones will
+be a waste of time until the next exec-state call has indicated that normal
+operations will resume. This is provided to allow timing sensitive network
+protocols to clean up and save enough state that a connection can be resumed at
+a later time.
 
 ## Timers
 
-There is a course grained monotonic timer that can be accessed which is also
-aligned with the blink- behavior of the cursor. To get access to it, you simply
-make sure there is a _tick_ function in your set of event handlers and it will
-be activated.
+There is a coarse grained timer that is enabled if you implement the 'tick'
+handler in your table. It has low resolution and low accuracy (~25Hz) and is
+meant for low maintenance periodic tasks, e.g. driving a data backup timer
+or 'blink' like UI state.

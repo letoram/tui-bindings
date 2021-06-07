@@ -35,19 +35,48 @@
 #ifndef HAVE_ARCAN_SHMIF_TUI_LUA
 #define HAVE_ARCAN_SHMIF_TUI_LUA
 
+struct blobio_meta;
+
 /*
  * user-data structures passed as tui-tags
  */
 struct tui_lmeta {
-	struct tui_context* tui;
+
+/* just have a fixed cap of these and compact on free, this is still
+ * an absurd amount of subwindows */
+	union {
+		struct tui_context* tui;
+		struct tui_context* subs[64];
+	};
+
+	size_t n_subs;
+
 	intptr_t href;
 
 /* pending subsegment requests and their respective lua references */
 	uint8_t pending_mask;
 	intptr_t pending[8];
 
+/* linked list of bchunk like processing jobs */
+	struct blobio_meta* blobs;
+
 	const char* last_words;
 	lua_State* lua;
+};
+
+struct blobio_meta {
+	int fd;
+	bool closed;
+	bool input;
+
+	bool got_buffer;
+	char* buf;
+	size_t buf_ofs;
+
+	uintptr_t data_cb;
+
+	struct blobio_meta* next;
+	struct tui_lmeta* owner;
 };
 
 struct tui_attr {

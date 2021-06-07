@@ -65,14 +65,14 @@ tui.open("input", "", {
 -- be re-injected as an on_key (below)
 	utf8 =
 		function(self, str)
-			add_str(str)
+			self:write(str)
 			return false
 		end,
 
 -- clipboard block of text
 	paste =
 		function(self, message)
-			add_str(message)
+			self:write(message)
 		end,
 
 -- This should be avoided and instead use label if possible, it is when

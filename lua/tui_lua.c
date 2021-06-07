@@ -6,16 +6,18 @@
  * able to open/connect using tui_open() -> context.
  *
  * TODO:
- *   [ ] State size
+ *   [ ] blob_asio:
+ *       add to wnd:process for data_handler
+ *
  *   [ ] Add bufferwnd/listwnd
  *   [ ] Handover exec
+ *
  *   [ ] multiple windows
- *   [ ] Progress
+ *       add to wnd:process for parent
+ *
  *   [ ] Scrollhint
- *   [ ] Character conversion helpers
  *   [ ] Hasglyph
  *   [ ] Window hint
- *   [ ] background copy
  *   [ ] handover media embed
  */
 
@@ -29,6 +31,7 @@
 #include <lua.h>
 #include <lauxlib.h>
 #include <lualib.h>
+#include <errno.h>
 
 #include "tui_lua.h"
 
@@ -201,16 +204,47 @@ static void on_reset(struct tui_context* T, int level, void* t)
 	lua_call(L, 2, 0);
 }
 
+static int blob_close(lua_State* L)
+{
+	struct blobio_meta* ib = luaL_checkudata(L, 1, "blob_asio");
+	if (ib->closed){
+		luaL_error(L, "close() on already closed blob");
+		return 0;
+	}
+
+	ib->closed = true;
+	close(ib->fd);
+	return 0;
+}
+
+static int blob_datahandler(lua_State* L)
+{
+/* two possible options, one is to set a lstring as the buffer to write and
+ * we take care of everything - though be mindful about GC and keep a reference
+ * until that happens.
+ *
+ * second is to add a callback handler and invoke that as part of wnd:process
+ */
+	return 0;
+}
+
+static void add_blobio(lua_State* L, struct tui_lmeta* M, bool input, int fd)
+{
+	struct blobio_meta* meta = lua_newuserdata(L, sizeof(struct blobio_meta));
+	*meta = (struct blobio_meta){
+		.fd = fd,
+		.input = input,
+		.owner = M
+	};
+	luaL_getmetatable(L, "blob_asio");
+	lua_setmetatable(L, -2);
+}
+
 static void on_state(struct tui_context* T, bool input, int fd, void* t)
 {
 	SETUP_HREF( (input?"state_in":"state_out"), );
-
-	FILE** pf = (FILE**) lua_newuserdata(L, sizeof(FILE*));
-	luaL_getmetatable(L, LUA_FILEHANDLE);
-	lua_setmetatable(L, -2);
-	*pf = fdopen(fd, input ? "r" : "w");
+	add_blobio(L, t, input, fd);
 	lua_call(L, 2, 0);
-
 	END_HREF;
 }
 
@@ -218,11 +252,7 @@ static void on_bchunk(struct tui_context* T,
 	bool input, uint64_t size, int fd, const char* type, void* t)
 {
 	SETUP_HREF((input ?"bchunk_in":"bchunk_out"), );
-
-	FILE** pf = (FILE**) lua_newuserdata(L, sizeof(FILE*));
-	luaL_getmetatable(L, LUA_FILEHANDLE);
-	lua_setmetatable(L, -2);
-	*pf = fdopen(fd, input ? "r" : "w");
+	add_blobio(L, t, input, fd);
 	lua_pushstring(L, type);
 	lua_call(L, 3, 0);
 
@@ -638,37 +668,6 @@ static int scrollhint(lua_State* L)
 	return 0;
 }
 
-static int cursor_steprow(lua_State* L)
-{
-	TUI_UDATA;
-	int n = luaL_optnumber(L, 2, 1);
-	bool scroll = luaL_optbnumber(L, 3, 0);
-	size_t rows, cols;
-	arcan_tui_dimensions(ib->tui, &rows, &cols);
-
-	if (n < 0)
-		arcan_tui_move_up(ib->tui, -n, scroll);
-	else
-		arcan_tui_move_down(ib->tui, n, scroll);
-
-	return 0;
-}
-
-static int cursor_stepcol(lua_State* L)
-{
-	TUI_UDATA;
-	int n = luaL_optnumber(L, 2, 1);
-	size_t rows, cols;
-	arcan_tui_dimensions(ib->tui, &rows, &cols);
-
-	if (n < 0)
-		arcan_tui_move_left(ib->tui, -n);
-	else
-		arcan_tui_move_right(ib->tui, n);
-
-	return 0;
-}
-
 static int screen_dimensions(lua_State* L)
 {
 	TUI_UDATA;
@@ -800,16 +799,6 @@ static int tui_open(lua_State* L)
 	return 1;
 }
 
-bool write_reset = false;
-static int refresh(lua_State* L)
-{
-	TUI_UDATA;
-	int rc = arcan_tui_refresh(ib->tui);
-	write_reset = false;
-	lua_pushnumber(L, rc);
-	return 1;
-}
-
 static int valid_flag(lua_State* L, int ind)
 {
 	return 0;
@@ -820,6 +809,16 @@ static int tuiclose(lua_State* L)
 	TUI_UDATA;
 	arcan_tui_destroy(ib->tui, luaL_optstring(L, 2, NULL));
 	ib->tui = NULL;
+
+	lua_rawgeti(L, LUA_REGISTRYINDEX, ib->href);
+	lua_getfield(L, -1, "destroy");
+	if (lua_type(L, -1) != LUA_TFUNCTION){
+		lua_pop(L, 2);
+		return 0;
+	}\
+	lua_pushvalue(L, -3);
+	lua_call(L, 1, 0);
+
 	return 0;
 }
 
@@ -924,7 +923,7 @@ static int process(lua_State* L)
  *                     getmetatable etc.) */
 
 	struct tui_process_res res =
-		arcan_tui_process(&ib->tui, 1, NULL, 0, timeout);
+		arcan_tui_process(ib->subs, ib->n_subs+1, NULL, 0, timeout);
 
 /*
  * FIXME: extract / translate error code and result-sets
@@ -966,9 +965,6 @@ static int getcursor(lua_State* L)
 static int write_tou8(lua_State* L)
 {
 	TUI_UDATA;
-	if (!write_reset){
-		write_reset = true;
-	}
 	struct tui_screen_attr* attr = NULL;
 	struct tui_screen_attr mattr = {};
 	size_t len;
@@ -1071,6 +1067,16 @@ static int failure(lua_State* L)
 	return 0;
 }
 
+static int refresh(lua_State* L)
+{
+	TUI_UDATA;
+
+/* primary blocks processing on failure */
+	int rc = arcan_tui_refresh(ib->tui);
+	lua_pushnumber(L, rc);
+	return 1;
+}
+
 static int announce_io(lua_State* L)
 {
 	TUI_UDATA;
@@ -1086,6 +1092,14 @@ static int request_io(lua_State* L)
 	const char* input = luaL_optstring(L, 2, "");
 	const char* output = luaL_optstring(L, 3, "");
 	arcan_tui_announce_io(ib->tui, true, input, output);
+	return 0;
+}
+
+static int statesize(lua_State* L)
+{
+	TUI_UDATA;
+	size_t state_sz = luaL_checknumber(L, 2);
+	arcan_tui_statesize(ib->tui, state_sz);
 	return 0;
 }
 
@@ -1142,8 +1156,8 @@ luaopen_arcantui(lua_State* L)
 	lua_settable(L, -3);
 
 	struct luaL_Reg tui_methods[] = {
-		{"refresh", refresh},
 		{"process", process},
+		{"refresh", refresh},
 		{"write", writeu8},
 		{"write_to", write_tou8},
 		{"set_handlers", settbl},
@@ -1169,6 +1183,8 @@ luaopen_arcantui(lua_State* L)
 		{"alert", alert},
 		{"notification", notification},
 		{"failure", failure},
+		{"state_size", statesize}
+
 /* MISSING:
  *    getxy,
  *    writestr,
@@ -1219,7 +1235,8 @@ luaopen_arcantui(lua_State* L)
 	{"error", TUI_COL_ERROR},
 	{"alert", TUI_COL_ALERT},
 	{"inactive", TUI_COL_INACTIVE},
-	{"reference", TUI_COL_REFERENCE}
+	{"reference", TUI_COL_REFERENCE},
+	{"ui", TUI_COL_UI},
 	};
 	lua_pushliteral(L, "colors");
 	lua_newtable(L);
@@ -1404,6 +1421,18 @@ luaopen_arcantui(lua_State* L)
 		lua_rawset(L, -3);
 	}
 	lua_settable(L, -3);
+
+/* used for blob-state handlers */
+	luaL_newmetatable(L, "blob_asio");
+	lua_pushvalue(L, -1);
+	lua_setfield(L, -2, "__index");
+	lua_pushcfunction(L, blob_close);
+	lua_setfield(L, -2, "close");
+	lua_pushcfunction(L, blob_close);
+	lua_setfield(L, -2, "_gc");
+	lua_pushcfunction(L, blob_datahandler);
+	lua_setfield(L, -2, "data_handler");
+	lua_pop(L, 1);
 
 	return 1;
 }
