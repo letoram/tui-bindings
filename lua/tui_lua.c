@@ -76,13 +76,13 @@ static void dump_stack(lua_State* ctx)
 			fprintf(stderr, lua_toboolean(ctx, i) ? "true" : "false");
 		break;
 		case LUA_TSTRING:
-			fprintf(stderr, "%d\t'%s'\n", i, lua_tostring(ctx, i));
+			fprintf(stderr, "%zu\t'%s'\n", i, lua_tostring(ctx, i));
 			break;
 		case LUA_TNUMBER:
-			fprintf(stderr, "%d\t%g\n", i, lua_tonumber(ctx, i));
+			fprintf(stderr, "%zu\t%g\n", i, lua_tonumber(ctx, i));
 			break;
 		default:
-			fprintf(stderr, "%d\t%s\n", i, lua_typename(ctx, t));
+			fprintf(stderr, "%zu\t%s\n", i, lua_typename(ctx, t));
 			break;
 		}
 	}
@@ -96,21 +96,6 @@ static void dump_stack(lua_State* ctx)
 #define TUI_UDATA	\
 	struct tui_lmeta* ib = luaL_checkudata(L, 1, TUI_METATABLE);\
 	if (!ib || !ib->tui) return 0; \
-
-/*
- * version of luaL_checknumber that accepts true/false as numbers
- */
-static lua_Number luaL_checkbnumber(lua_State* L, int narg)
-{
-	lua_Number d = lua_tonumber(L, narg);
-	if (d == 0 && !lua_isnumber(L, narg)){
-		if (!lua_isboolean(L, narg))
-			luaL_typerror(L, narg, "number or boolean");
-		else
-			d = lua_toboolean(L, narg);
-	}
-	return d;
-}
 
 static lua_Number luaL_optbnumber(lua_State* L, int narg, lua_Number opt)
 {
@@ -464,6 +449,7 @@ static int on_cli_command(struct tui_context* T,
  * last item in argv, set that to an empty string. The remaining feedback
  * items refer to possible additional items to [argv].
  */
+	return TUI_CLI_INVALID;
 }
 
 static bool intblbool(lua_State* L, int ind, const char* field)
@@ -593,61 +579,6 @@ static int defattr(lua_State* L)
 		add_attr_tbl(L, arcan_tui_defattr(ib->tui, NULL));
 
 	return 1;
-}
-
-static int set_tabstop(lua_State* L)
-{
-	TUI_UDATA;
-	int col = luaL_optnumber(L, 2, -1);
-	int row = luaL_optnumber(L, 3, -1);
-
-	if (row != -1 || col != -1){
-		size_t x, y;
-		arcan_tui_cursorpos(ib->tui, &x, &y);
-		arcan_tui_move_to(ib->tui, row != -1 ? row : y, col != -1 ? col : x);
-		arcan_tui_set_tabstop(ib->tui);
-		arcan_tui_move_to(ib->tui, x, y);
-	}
-	else
-		arcan_tui_set_tabstop(ib->tui);
-	return 0;
-}
-
-static int insert_lines(lua_State* L)
-{
-	TUI_UDATA;
-	int n_lines = luaL_checknumber(L, 2);
-	if (n_lines > 0)
-		arcan_tui_insert_lines(ib->tui, n_lines);
-	return 0;
-}
-
-static int delete_lines(lua_State* L)
-{
-	TUI_UDATA;
-	int n_lines = luaL_checknumber(L, 2);
-
-	if (n_lines > 0)
-		arcan_tui_delete_lines(ib->tui, n_lines);
-	return 0;
-}
-
-static int insert_chars(lua_State* L)
-{
-	TUI_UDATA;
-	int n_chars = luaL_checknumber(L, 2);
-	if (n_chars > 0)
-		arcan_tui_insert_chars(ib->tui, n_chars);
-	return 0;
-}
-
-static int delete_chars(lua_State* L)
-{
-	TUI_UDATA;
-	int n_chars = luaL_checknumber(L, 2);
-	if (n_chars > 0)
-		arcan_tui_delete_chars(ib->tui, n_chars);
-	return 0;
 }
 
 static int wnd_scroll(lua_State* L)
@@ -797,11 +728,6 @@ static int tui_open(lua_State* L)
 	}
 
 	return 1;
-}
-
-static int valid_flag(lua_State* L, int ind)
-{
-	return 0;
 }
 
 static int tuiclose(lua_State* L)
@@ -1108,8 +1034,6 @@ static int statesize(lua_State* L)
 static int
 apiversion(lua_State *L)
 {
-	int major, minor, micro;
-
 	lua_newtable(L);
 	lua_pushinteger(L, 1);
 	lua_setfield(L, -2, "major");
@@ -1130,7 +1054,6 @@ apiversionstr(lua_State* L)
 int
 luaopen_arcantui(lua_State* L)
 {
-	int n;
 	struct luaL_Reg luaarcantui[] = {
 		{"APIVersion", apiversion},
 		{"APIVersionString", apiversionstr},
@@ -1433,6 +1356,9 @@ luaopen_arcantui(lua_State* L)
 	lua_pushcfunction(L, blob_datahandler);
 	lua_setfield(L, -2, "data_handler");
 	lua_pop(L, 1);
+
+	if (0)
+		dump_stack(L);
 
 	return 1;
 }
