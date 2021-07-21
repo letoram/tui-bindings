@@ -1,7 +1,7 @@
 /*
  TUI Lua Bindings
 
- Copyright (c) 2017-2018, Bjorn Stahl
+ Copyright (c) Bjorn Stahl
  All rights reserved.
 
  Redistribution and use in source and binary forms,
@@ -37,6 +37,14 @@
 
 struct blobio_meta;
 
+enum tui_builtin_widgets {
+	TWND_NORMAL = 0,
+	TWND_LISTWND = 1,
+	TWND_BUFWND = 2,
+	TWND_READLINE = 3,
+	TWND_LINEWND = 4
+};
+
 /*
  * user-data structures passed as tui-tags
  */
@@ -50,8 +58,11 @@ struct tui_lmeta {
 	};
 
 	size_t n_subs;
+	int widget_mode;
+	struct tui_list_entry* tmplist;
 
 	intptr_t href;
+	intptr_t widget_closure;
 
 /* pending subsegment requests and their respective lua references */
 	uint8_t pending_mask;
