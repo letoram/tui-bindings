@@ -2,7 +2,7 @@ project('arcantui', 'c', default_options : ['c_std=c11'])
 shmif = dependency('arcan-shmif-tui')
 
 foreach ver : ['1', '2', '3', '4']
-    lua = dependency('lua5' + ver, required: false)
+    lua = dependency('lua5.' + ver, required: false)
     if lua.found()
         luadir = 'lib/lua/5.' + ver
         break

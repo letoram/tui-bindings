@@ -94,21 +94,10 @@ struct tui_attr {
 	struct tui_screen_attr attr;
 };
 
-#ifdef ARCAN_LUA_TUI_DYNAMIC
-typedef void (* PLTUIEXPOSE)(lua_State*);
-static PLTUIEXPOSE tui_lua_expose;
+struct tui_context*
+ltui_inherit(lua_State* L, arcan_tui_conn*);
 
-static bool arcan_tui_dynload(void*(*lookup)(void*, const char*), void* tag)
-{
-	return ( tui_lua_expose = lookup(tag, "tui_lua_expose") ) != NULL;
-}
-
-#else
-
-/*
- * apply/add the TUI/Lua bindings to a lua VM context
- */
-void tui_lua_expose(lua_State*);
-#endif
+int
+luaopen_arcantui(lua_State* L);
 
 #endif

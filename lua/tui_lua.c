@@ -69,6 +69,7 @@ static struct tui_cbcfg shared_cbcfg = {};
 
 #define END_HREF lua_pop(L, 1);
 
+static void register_tuimeta(lua_State* L);
 static void dump_stack(lua_State* ctx)
 {
 	int top = lua_gettop(ctx);
@@ -389,7 +390,7 @@ static bool query_label(struct tui_context* T,
 		dstlbl->modifiers = luaL_optnumber(L, -2, 0);
 		const char* vsym = luaL_optstring(L, -1, NULL);
 		if (vsym){
-			snprintf(dstlbl->vsym, COUNT_OF(dstlbl->vsym), "%s", vsym);
+			snprintf((char*)dstlbl->vsym, COUNT_OF(dstlbl->vsym), "%s", vsym);
 		}
 
 		dstlbl->idatatype = 0; /* only support buttons for now */
@@ -698,18 +699,26 @@ static int tui_open(lua_State* L)
 	const char* title = luaL_checkstring(L, 1);
 	const char* ident = luaL_checkstring(L, 2);
 
-	struct tui_lmeta* meta = lua_newuserdata(L, sizeof(struct tui_lmeta));
-	if (!meta){
-		return 0;
-	}
-	*meta = (struct tui_lmeta){0};
-
 	arcan_tui_conn* conn = arcan_tui_open_display(title, ident);
 /* will be GCd */
 	if (!conn){
 		lua_pop(L, 1);
 		return 0;
 	}
+
+	return ltui_inherit(L, conn) ? 1 : 0;
+}
+
+struct tui_context*
+ltui_inherit(lua_State* L, arcan_tui_conn* conn)
+{
+	register_tuimeta(L);
+
+	struct tui_lmeta* meta = lua_newuserdata(L, sizeof(struct tui_lmeta));
+	if (!meta){
+		return NULL;
+	}
+	*meta = (struct tui_lmeta){0};
 
 /* set the TUI api table to our metadata */
 	luaL_getmetatable(L, TUI_METATABLE);
@@ -761,7 +770,7 @@ static int tui_open(lua_State* L)
 		}
 		else{
 			lua_pop(L, 1);
-			return 0;
+			return NULL;
 		}
 	}
 
@@ -769,10 +778,10 @@ static int tui_open(lua_State* L)
 	meta->tui = arcan_tui_setup(conn, NULL, &shared_cbcfg, sizeof(shared_cbcfg));
 	if (!meta->tui){
 		lua_pop(L, 1);
-		return 0;
+		return NULL;
 	}
 
-	return 1;
+	return meta->tui;
 }
 
 static int tuiclose(lua_State* L)
@@ -804,7 +813,7 @@ static int collect(lua_State* L)
 		ib->tui = NULL;
 	}
 	if (ib->href != LUA_REFNIL){
-		lua_unref(L, ib->href);
+		luaL_unref(L, LUA_REGISTRYINDEX, ib->href);
 		ib->href = LUA_REFNIL;
 	}
 
@@ -815,12 +824,13 @@ static int settbl(lua_State* L)
 {
 	TUI_WNDDATA;
 	if (ib->href != LUA_REFNIL){
-		lua_unref(L, ib->href);
+		luaL_unref(L, LUA_REGISTRYINDEX, ib->href);
 		ib->href = LUA_REFNIL;
 	}
 
 	luaL_checktype(L, 2, LUA_TTABLE);
 	ib->href = luaL_ref(L, LUA_REGISTRYINDEX);
+	printf("handle table updated to: %lld\n", ib->href);
 
 	return 0;
 }
@@ -915,7 +925,20 @@ static int process(lua_State* L)
 		break;
 		case TWND_BUFWND:
 		break;
-		case TWND_READLINE:
+		case TWND_READLINE:{
+			char* buf;
+			int sc = arcan_tui_readline_finished(ib->tui, &buf);
+			if (!sc){
+				lua_rawgeti(L, LUA_REGISTRYINDEX, ib->widget_closure);
+			}
+			if (buf){
+			}
+			else {
+				lua_pushnil(L);
+			}
+			lua_pcall(L, 1, 0, 0);
+			revert(L, ib);
+		}
 		break;
 		default:
 		break;
@@ -1118,6 +1141,39 @@ static void tbl_to_list(lua_State* L, struct tui_list_entry* base, size_t i)
 	};
 }
 
+static int readline(lua_State* L)
+{
+	TUI_WNDDATA;
+	revert(L, ib);
+	ssize_t ofs = 1;
+
+	struct tui_readline_opts opts = {
+		.n_rows = 1,
+		.margin_left = 0,
+		.margin_right = 0,
+		.allow_exit = false,
+		.autocomplete = NULL, /* on_readline_autocomplete */
+		.filter_character = NULL, /* on_readline_filter_character */
+		.mask_character = 0,
+		.multiline = false,
+		.verify = NULL, /* on_readline_verify */
+		.suggest = NULL, /* on_readline_suggest */
+/* history */
+	};
+
+	if (lua_type(L, ofs) == LUA_TTABLE){
+		luaL_error(L, "readline(prompt, [table], closure) - missing table");
+		ofs++;
+	}
+	if (!lua_isfunction(L, ofs) || lua_iscfunction(L, ofs)){
+		luaL_error(L, "readline([table], closure) - missing closure");
+	}
+/* 1. grab closure, set as widget */
+/* 2. build new reference table with right metatable */
+/* 3. convert / set history */
+	return 0;
+}
+
 static int listwnd(lua_State* L)
 {
 	TUI_WNDDATA;
@@ -1125,14 +1181,7 @@ static int listwnd(lua_State* L)
 /* normally just drop whatever previous state we were in */
 	revert(L, ib);
 
-/* label, attributes (), tag (just index),
- * then on refresh we need to call listwnd_status and
-		struct tui_list_entry* ent;
-		if (arcan_tui_listwnd_status(tui, &ent)){
-	 * use that to trigger the callback. */
-
 /* take input table and closure */
-
 	if (lua_type(L, 2) != LUA_TTABLE){
 		luaL_error(L, "set_list(table, closure) - missing table");
 	}
@@ -1187,33 +1236,8 @@ apiversionstr(lua_State* L)
 	return 1;
 }
 
-int
-luaopen_arcantui(lua_State* L)
+static void register_tuimeta(lua_State* L)
 {
-	struct luaL_Reg luaarcantui[] = {
-		{"APIVersion", apiversion},
-		{"APIVersionString", apiversionstr},
-		{"open", tui_open},
-		{"get_attribute", tui_attr},
-	};
-
-	lua_newtable(L);
-	for (size_t i = 0; i < sizeof(luaarcantui)/sizeof(luaarcantui[0]); i++){
-		lua_pushstring(L, luaarcantui[i].name);
-		lua_pushcfunction(L, luaarcantui[i].func);
-		lua_settable(L, -3);
-	}
-
-	lua_pushliteral(L, "_COPYRIGHT");
-	lua_pushliteral(L, "Copyright (C) Bjorn Stahl");
-	lua_settable(L, -3);
-	lua_pushliteral(L, "_DESCRIPTION");
-	lua_pushliteral(L, "TUI API for Arcan");
-	lua_settable(L, -3);
-	lua_pushliteral(L, "_VERSION");
-	lua_pushliteral(L, "arcantuiapi 1.0.0");
-	lua_settable(L, -3);
-
 	struct luaL_Reg tui_methods[] = {
 		{"process", process},
 		{"refresh", refresh},
@@ -1245,8 +1269,8 @@ luaopen_arcantui(lua_State* L)
 		{"state_size", statesize},
 		{"revert", revertwnd},
 		{"set_list", listwnd},
+		{"readline", readline},
 /* set_buffer
- * readline
  */
 
 /* MISSING:
@@ -1498,8 +1522,42 @@ luaopen_arcantui(lua_State* L)
 	lua_setfield(L, -2, "data_handler");
 	lua_pop(L, 1);
 
-	if (0)
-		dump_stack(L);
+/*
+	luaL_newmetatable(L, "listwnd");
+	lua_pushvalue(L, -1);
+	lua_setfield(L, -2, "__index");
+	lua_pushcfunction(L, listwnd_seek);
+ */
+}
+
+int
+luaopen_arcantui(lua_State* L)
+{
+	struct luaL_Reg luaarcantui[] = {
+		{"APIVersion", apiversion},
+		{"APIVersionString", apiversionstr},
+		{"open", tui_open},
+		{"get_attribute", tui_attr},
+	};
+
+	lua_newtable(L);
+	for (size_t i = 0; i < sizeof(luaarcantui)/sizeof(luaarcantui[0]); i++){
+		lua_pushstring(L, luaarcantui[i].name);
+		lua_pushcfunction(L, luaarcantui[i].func);
+		lua_settable(L, -3);
+	}
+
+	lua_pushliteral(L, "_COPYRIGHT");
+	lua_pushliteral(L, "Copyright (C) Bjorn Stahl");
+	lua_settable(L, -3);
+	lua_pushliteral(L, "_DESCRIPTION");
+	lua_pushliteral(L, "TUI API for Arcan");
+	lua_settable(L, -3);
+	lua_pushliteral(L, "_VERSION");
+	lua_pushliteral(L, "arcantuiapi 1.0.0");
+	lua_settable(L, -3);
+
+	register_tuimeta(L);
 
 	return 1;
 }
