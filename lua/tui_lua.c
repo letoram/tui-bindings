@@ -6,21 +6,23 @@
  * able to open/connect using tui_open() -> context.
  *
  * TODO:
- *   [ ] blob_asio:
- *       add to wnd:process for data_handler
+ *   [ ] add blob-io from arcan
+ *   [ ] add bgcopy with signalling
+ *   [ ] handover exec on new window
+ *   [ ] arcan_tui_wndhint support
  *
  *   [ ] Add bufferwnd
- *   [ ] Handover exec
  *
  *   [ ] multiple windows
  *       add to wnd:process for parent
+ *       allow extended form with window creation hints
  *
- *   [ ] Scrollhint
+ *   [ ] apaste/vpaste does nothing - map to bchunk_in?
  *   [ ] Hasglyph
- *   [ ] Window hint
  *   [ ] Handover media embed
- *   [ ] Empty states (exec_state, visibility, ...)
  */
+
+#define _POSIX_C_SOURCE 200809L
 
 #include <arcan_shmif.h>
 #include <arcan_tui.h>
@@ -34,6 +36,8 @@
 #include <lauxlib.h>
 #include <lualib.h>
 #include <errno.h>
+#include <string.h>
+#include <strings.h>
 
 #include "tui_lua.h"
 
@@ -105,15 +109,32 @@ static void dump_stack(lua_State* ctx)
  */
 #define TUI_WNDDATA	\
 	struct tui_lmeta* ib = luaL_checkudata(L, 1, TUI_METATABLE);\
-	if (!ib || !ib->tui || ib->widget_mode != TWND_NORMAL) return 0; \
+	if (!ib || !ib->tui || ib->widget_mode != TWND_NORMAL)\
+		luaL_error(L, "window not in normal state");\
 
 #define TUI_UDATA \
 	struct tui_lmeta* ib = luaL_checkudata(L, 1, TUI_METATABLE);\
-	if (!ib || !ib->tui) return 0; \
+	if (!ib || !ib->tui) {\
+		luaL_error(L, !ib ? "no userdata" : "no tui context"); \
+	}\
 
 #define TUI_LWNDDATA \
 	struct tui_lmeta* ib = luaL_checkudata(L, 1, TUI_METATABLE);\
-	if (!ib || !ib->tui || !ib->widget_mode != TWND_LINEWND) return 0; \
+	if (!ib || !ib->tui || ib->widget_mode != TWND_LINEWND)\
+		luaL_error(L, "window not in linewnd state");
+
+#define TUI_BUFWNDDATA \
+	struct tui_lmeta* ib = luaL_checkudata(L, 1, TUI_METATABLE);\
+	if (!ib || !ib->tui || ib->widget_mode != TWND_BUFWND)\
+		luaL_error(L, "window not in bufferwnd state");
+
+#define TUI_READLINEDATA \
+	struct widget_meta* meta = luaL_checkudata(L, 1, "widget_readline");\
+	if (!meta || !meta->parent)\
+		luaL_error(L, "widget metadata freed");\
+	struct tui_lmeta* ib = meta->parent;\
+	if (!ib || !ib->tui || ib->widget_mode != TWND_READLINE)\
+		luaL_error(L, "window not in readline state");
 
 static lua_Number luaL_optbnumber(lua_State* L, int narg, lua_Number opt)
 {
@@ -146,6 +167,7 @@ static bool on_u8(struct tui_context* T, const char* u8, size_t len, void* t)
 			rv = lua_tonumber(L, -1);
 		else if (lua_isboolean(L, -1))
 			rv = lua_toboolean(L, -1);
+		lua_pop(L, 1);
 	END_HREF;
 	return rv;
 }
@@ -297,7 +319,13 @@ static void on_utf8_paste(struct tui_context* T,
 static void on_resized(struct tui_context* T,
 	size_t neww, size_t newh, size_t col, size_t row, void* t)
 {
+/* ugly little edge condition - the first on_resized will actually be called in
+ * tui-setup already where we don't have the rest of the context or things
+ * otherwise prepared. This will cause our TUI_UDATA etc. to fail as the tui
+ * member has not yet been set. */
 	SETUP_HREF("resized",);
+		if (!meta->tui)
+			meta->tui = T;
 		lua_pushnumber(L, col);
 		lua_pushnumber(L, row);
 		lua_pushnumber(L, neww);
@@ -397,11 +425,6 @@ static bool query_label(struct tui_context* T,
 	}
 	lua_pop(L, 5);
 
-/*
- * MISSING:
- * lcall with country/lang, expect multi-return with label, descr
- * and fill in - if no arguments returned
- */
 	END_HREF;
 	return gotrep;
 }
@@ -410,28 +433,66 @@ static void on_geohint(struct tui_context* T, float lat,
 	float longitude, float elev, const char* a3_country,
 	const char* a3_language, void* t)
 {
-}
+	SETUP_HREF("geohint",);
+	lua_pushstring(L, a3_country);
+	lua_pushstring(L, a3_language);
 
-static bool on_substitute(struct tui_context* T,
-	struct tui_cell* cells, size_t n_cells, size_t row, void* t)
-{
-	return false;
+	lua_pushnumber(L, lat);
+	lua_pushnumber(L, longitude);
+	lua_pushnumber(L, elev);
+
+	lua_call(L, 6, 0);
+	END_HREF;
 }
 
 static void on_visibility(
 	struct tui_context* T, bool visible, bool focus, void* t)
 {
+	SETUP_HREF("visibility",);
+		lua_pushboolean(L, visible);
+		lua_pushboolean(L, focus);
+		lua_call(L, 3, 0);
+	END_HREF;
 }
 
 static void on_exec_state(struct tui_context* T, int state, void* t)
 {
-/*
- * Context has changed liveness state
- * 0 : normal operation
- * 1 : suspend state, execution should be suspended, next event will
- *     exec_state into normal or terminal state
- * 2 : terminal state, context is dead
- */
+	SETUP_HREF("exec_state",);
+		switch(state){
+		case 0:
+		lua_pushstring(L, "resume");
+		break;
+		case 1:
+		lua_pushstring(L, "suspend");
+		break;
+		case 2:
+		lua_pushstring(L, "shutdown");
+		break;
+		default:
+			lua_pop(L, 1);
+			return;
+		break;
+		}
+	lua_call(L, 2, 0);
+	END_HREF;
+}
+
+static void on_seek_absolute(struct tui_context* T, float pct, void* t)
+{
+	SETUP_HREF("seek_absolute", );
+		lua_pushnumber(L, pct);
+		lua_pcall(L, 1, 0, 0);
+	END_HREF;
+}
+
+static void on_seek_relative(
+		struct tui_context* T, ssize_t rows, ssize_t cols, void* t)
+{
+	SETUP_HREF("seek_relative", );
+		lua_pushnumber(L, rows);
+		lua_pushnumber(L, cols);
+		lua_pcall(L, 1, 0, 0);
+	END_HREF;
 }
 
 static int on_cli_command(struct tui_context* T,
@@ -478,9 +539,10 @@ static bool intblbool(lua_State* L, int ind, const char* field)
 	return rv;
 }
 
-static int intblint(lua_State* L, int ind, const char* field)
+static int intblint(lua_State* L, int ind, const char* field, bool* ok)
 {
 	lua_getfield(L, ind, field);
+	*ok = lua_isnumber(L, -1);
 	int rv = lua_tointeger(L, -1);
 	lua_pop(L, 1);
 	return rv;
@@ -527,6 +589,19 @@ static void add_attr_tbl(lua_State* L, struct tui_screen_attr attr)
 #undef SET_BIV
 }
 
+static void free_history(struct widget_meta* m)
+{
+	if (!m->readline.history)
+		return;
+
+	for (size_t i = 0; i < m->readline.history_sz; i++){
+		free(m->readline.history[i]);
+	}
+
+	free(m->readline.history);
+	m->readline.history = NULL;
+}
+
 static void revert(lua_State* L, struct tui_lmeta* M)
 {
 	switch (M->widget_mode){
@@ -540,6 +615,18 @@ static void revert(lua_State* L, struct tui_lmeta* M)
 	break;
 	case TWND_READLINE:
 		arcan_tui_readline_release(M->tui);
+		if (M->widget_meta){
+			struct widget_meta* wm = M->widget_meta;
+			if (wm->readline.verify){
+				luaL_unref(L, LUA_REGISTRYINDEX, wm->readline.verify);
+				M->widget_meta->readline.verify = LUA_NOREF;
+			}
+			if (wm->readline.suggest){
+				luaL_unref(L, LUA_REGISTRYINDEX, wm->readline.suggest);
+				M->widget_meta->readline.suggest = LUA_NOREF;
+			}
+			free_history(wm);
+		}
 	break;
 	case TWND_LINEWND:
 /* arcan_tui_linewnd_release(M->tui); */
@@ -549,6 +636,10 @@ static void revert(lua_State* L, struct tui_lmeta* M)
 	}
 
 	M->widget_mode = TWND_NORMAL;
+	if (M->widget_meta){
+		M->widget_meta->parent = NULL;
+		M->widget_meta = NULL;
+	}
 	if (M->widget_closure){
 		luaL_unref(L, LUA_REGISTRYINDEX, M->widget_closure);
 		M->widget_closure = LUA_NOREF;
@@ -569,24 +660,35 @@ static void apply_table(lua_State* L, int ind, struct tui_screen_attr* attr)
 	attr->aflags |= TUI_ATTR_STRIKETHROUGH * intblbool(L, ind, "strikethrough");
 	attr->aflags |= TUI_ATTR_SHAPE_BREAK * intblbool(L, ind, "break");
 
-	attr->custom_id = intblint(L, ind, "id");
+	bool ok;
+	attr->custom_id = intblint(L, ind, "id", &ok);
 
 	attr->fg = attr->fb = attr->fr = 0;
 	attr->bg = attr->bb = attr->br = 0;
 
-	int val = intblint(L, ind, "fc");
-	if (-1 != val){
+	int val = intblint(L, ind, "fc", &ok);
+	if (-1 != val && ok){
 		attr->aflags |= TUI_ATTR_COLOR_INDEXED;
 		attr->fc[0] = (uint8_t) val;
-		attr->bc[0] = (uint8_t) intblint(L, ind, "bc");
+		attr->bc[0] = (uint8_t) intblint(L, ind, "bc", &ok);
 	}
 	else {
-		attr->fr = (uint8_t) intblint(L, ind, "fr");
-		attr->fg = (uint8_t) intblint(L, ind, "fg");
-		attr->fb = (uint8_t) intblint(L, ind, "fb");
-		attr->br = (uint8_t) intblint(L, ind, "br");
-		attr->bg = (uint8_t) intblint(L, ind, "bg");
-		attr->bb = (uint8_t) intblint(L, ind, "bb");
+		intblint(L, ind, "fr", &ok);
+		if (ok){
+			attr->fr = (uint8_t) intblint(L, ind, "fr", &ok);
+			attr->fg = (uint8_t) intblint(L, ind, "fg", &ok);
+			attr->fb = (uint8_t) intblint(L, ind, "fb", &ok);
+		}
+		else {
+			attr->fr = attr->fg = attr->fb = 196;
+		}
+
+		intblint(L, ind, "br", &ok);
+		if (ok){
+			attr->br = (uint8_t) intblint(L, ind, "br", &ok);
+			attr->bg = (uint8_t) intblint(L, ind, "bg", &ok);
+			attr->bb = (uint8_t) intblint(L, ind, "bb", &ok);
+		}
 	}
 }
 
@@ -614,7 +716,7 @@ static int tui_attr(lua_State* L)
 
 static int defattr(lua_State* L)
 {
-	TUI_WNDDATA;
+	TUI_UDATA;
 	if (lua_istable(L, 2)){
 		struct tui_screen_attr rattr = {};
 		apply_table(L, 2, &rattr);
@@ -622,15 +724,15 @@ static int defattr(lua_State* L)
 			arcan_tui_defattr(ib->tui, &rattr));
 	}
 	else
-		add_attr_tbl(L, arcan_tui_defattr(ib->tui, NULL));
+		add_attr_tbl(L, arcan_tui_defcattr(ib->tui, TUI_COL_TEXT));
 
 	return 1;
 }
 
 static int wnd_scroll(lua_State* L)
 {
-	TUI_WNDDATA;
-	int steps = luaL_checknumber(L, 2);
+	TUI_UDATA;
+	int steps = luaL_checkint(L, 2);
 	if (steps > 0)
 		arcan_tui_scroll_down(ib->tui, steps);
 	else
@@ -638,16 +740,9 @@ static int wnd_scroll(lua_State* L)
 	return 0;
 }
 
-static int scrollhint(lua_State* L)
-{
-	TUI_WNDDATA;
-/* MISSING */
-	return 0;
-}
-
 static int screen_dimensions(lua_State* L)
 {
-	TUI_WNDDATA;
+	TUI_UDATA;
 	size_t rows, cols;
 	arcan_tui_dimensions(ib->tui, &rows, &cols);
 	lua_pushnumber(L, cols);
@@ -657,11 +752,11 @@ static int screen_dimensions(lua_State* L)
 
 static int erase_region(lua_State* L)
 {
-	TUI_WNDDATA;
-	size_t x1 = luaL_checknumber(L, 2);
-	size_t y1 = luaL_checknumber(L, 3);
-	size_t x2 = luaL_checknumber(L, 4);
-	size_t y2 = luaL_checknumber(L, 5);
+	TUI_UDATA;
+	size_t x1 = luaL_checkint(L, 2);
+	size_t y1 = luaL_checkint(L, 3);
+	size_t x2 = luaL_checkint(L, 4);
+	size_t y2 = luaL_checkint(L, 5);
 	bool prot = luaL_optbnumber(L, 6, false);
 	size_t rows, cols;
 	arcan_tui_dimensions(ib->tui, &rows, &cols);
@@ -674,7 +769,7 @@ static int erase_region(lua_State* L)
 
 static int erase_screen(lua_State* L)
 {
-	TUI_WNDDATA;
+	TUI_UDATA;
 	bool prot = luaL_optbnumber(L, 2, false);
 	arcan_tui_erase_screen(ib->tui, prot);
 	return 0;
@@ -682,9 +777,9 @@ static int erase_screen(lua_State* L)
 
 static int cursor_to(lua_State* L)
 {
-	TUI_WNDDATA;
-	int x = luaL_checknumber(L, 2);
-	int y = luaL_checknumber(L, 3);
+	TUI_UDATA;
+	int x = luaL_checkint(L, 2);
+	int y = luaL_checkint(L, 3);
 	size_t rows, cols;
 	arcan_tui_dimensions(ib->tui, &rows, &cols);
 
@@ -751,10 +846,11 @@ ltui_inherit(lua_State* L, arcan_tui_conn* conn)
 		.recolor = on_recolor,
 		.reset = on_reset,
 		.geohint = on_geohint,
-		.substitute = on_substitute,
 		.visibility = on_visibility,
 		.exec_state = on_exec_state,
 		.cli_command = on_cli_command,
+		.seek_absolute = on_seek_absolute,
+		.seek_relative = on_seek_relative,
 		.tag = meta
 	};
 	meta->href = LUA_REFNIL;
@@ -786,7 +882,7 @@ ltui_inherit(lua_State* L, arcan_tui_conn* conn)
 
 static int tuiclose(lua_State* L)
 {
-	TUI_WNDDATA;
+	TUI_UDATA;
 	arcan_tui_destroy(ib->tui, luaL_optstring(L, 2, NULL));
 	ib->tui = NULL;
 
@@ -822,7 +918,7 @@ static int collect(lua_State* L)
 
 static int settbl(lua_State* L)
 {
-	TUI_WNDDATA;
+	TUI_UDATA;
 	if (ib->href != LUA_REFNIL){
 		luaL_unref(L, LUA_REGISTRYINDEX, ib->href);
 		ib->href = LUA_REFNIL;
@@ -830,14 +926,13 @@ static int settbl(lua_State* L)
 
 	luaL_checktype(L, 2, LUA_TTABLE);
 	ib->href = luaL_ref(L, LUA_REGISTRYINDEX);
-	printf("handle table updated to: %lld\n", ib->href);
 
 	return 0;
 }
 
 static int setident(lua_State* L)
 {
-	TUI_WNDDATA;
+	TUI_UDATA;
 	const char* ident = luaL_optstring(L, 2, "");
 	arcan_tui_ident(ib->tui, ident);
 	return 0;
@@ -845,7 +940,7 @@ static int setident(lua_State* L)
 
 static int setcopy(lua_State* L)
 {
-	TUI_WNDDATA;
+	TUI_UDATA;
 	const char* pstr = luaL_optstring(L, 2, "");
 	lua_pushboolean(L, arcan_tui_copy(ib->tui, pstr));
 	return 1;
@@ -853,7 +948,7 @@ static int setcopy(lua_State* L)
 
 static int reqwnd(lua_State* L)
 {
-	TUI_WNDDATA;
+	TUI_UDATA;
 
 	const char* type = luaL_optstring(L, 2, "tui");
 	int ind;
@@ -863,7 +958,7 @@ static int reqwnd(lua_State* L)
 		luaL_ref(L, LUA_REGISTRYINDEX);
 	}
 	else
-		lua_error(L);
+		luaL_error(L, "no closure provided");
 
 	int tui_type = TUI_WND_TUI;
 	if (strcmp(type, "popup") == 0)
@@ -885,18 +980,24 @@ static int reqwnd(lua_State* L)
 	return 1;
 }
 
-static int setmouse(lua_State* L)
+static int alive(lua_State* L)
 {
-	TUI_WNDDATA;
-/* FIXME: mouse forward, either grab value or toggle */
-	return 0;
+	struct tui_lmeta* ib = luaL_checkudata(L, 1, TUI_METATABLE);
+	if (!ib){
+		luaL_error(L, !ib ? "no userdata" : "no tui context");
+	}
+	lua_pushboolean(L, ib->tui != NULL);
+	return 1;
 }
 
 static int process(lua_State* L)
 {
-	TUI_WNDDATA;
+	TUI_UDATA;
 
 	int timeout = luaL_optnumber(L, 2, -1);
+
+	if (0)
+		dump_stack(L);
 
 /* FIXME: extend processing set with children, pull in table of file,
  *        extract their descriptor sets and poll, set results.
@@ -928,16 +1029,20 @@ static int process(lua_State* L)
 		case TWND_READLINE:{
 			char* buf;
 			int sc = arcan_tui_readline_finished(ib->tui, &buf);
-			if (!sc){
+			if (sc){
 				lua_rawgeti(L, LUA_REGISTRYINDEX, ib->widget_closure);
+				lua_rawgeti(L, LUA_REGISTRYINDEX, ib->href);
+				if (buf){
+					lua_pushstring(L, buf);
+				}
+				else {
+					lua_pushnil(L);
+				}
+/* Restore the context to its initial state so that the closure is allowed to
+ * request a new readline request. Revert will actually free buf. */
+				revert(L, ib);
+				lua_pcall(L, 2, 0, 0);
 			}
-			if (buf){
-			}
-			else {
-				lua_pushnil(L);
-			}
-			lua_pcall(L, 1, 0, 0);
-			revert(L, ib);
 		}
 		break;
 		default:
@@ -974,7 +1079,7 @@ static int process(lua_State* L)
 
 static int getcursor(lua_State* L)
 {
-	TUI_WNDDATA;
+	TUI_UDATA;
 	size_t x, y;
 	arcan_tui_cursorpos(ib->tui, &x, &y);
 	lua_pushnumber(L, x);
@@ -984,13 +1089,13 @@ static int getcursor(lua_State* L)
 
 static int write_tou8(lua_State* L)
 {
-	TUI_WNDDATA;
+	TUI_UDATA;
 	struct tui_screen_attr* attr = NULL;
 	struct tui_screen_attr mattr = {};
 	size_t len;
 
-	size_t x = luaL_checknumber(L, 2);
-	size_t y = luaL_checknumber(L, 3);
+	size_t x = luaL_checkint(L, 2);
+	size_t y = luaL_checkint(L, 3);
 	size_t ox, oy;
 	arcan_tui_cursorpos(ib->tui, &ox, &oy);
 	const char* buf =	luaL_checklstring(L, 4, &len);
@@ -1012,7 +1117,7 @@ static int write_tou8(lua_State* L)
 
 static int writeu8(lua_State* L)
 {
-	TUI_WNDDATA;
+	TUI_UDATA;
 	struct tui_screen_attr* attr = NULL;
 	struct tui_screen_attr mattr = {};
 	size_t len;
@@ -1031,16 +1136,17 @@ static int writeu8(lua_State* L)
 
 static int reset(lua_State* L)
 {
-	TUI_WNDDATA;
+	TUI_UDATA;
+	revert(L, ib);
 	arcan_tui_reset(ib->tui);
 	return 0;
 }
 
 static int color_get(lua_State* L)
 {
-	TUI_WNDDATA;
+	TUI_UDATA;
 	uint8_t dst[3] = {128, 128, 128};
-	arcan_tui_get_color(ib->tui, luaL_checknumber(L, 2), dst);
+	arcan_tui_get_color(ib->tui, luaL_checkint(L, 2), dst);
 	lua_pushnumber(L, dst[0]);
 	lua_pushnumber(L, dst[1]);
 	lua_pushnumber(L, dst[2]);
@@ -1049,47 +1155,59 @@ static int color_get(lua_State* L)
 
 static int set_flags(lua_State* L)
 {
-	TUI_WNDDATA;
-	arcan_tui_set_flags(ib->tui, luaL_checknumber(L, 2));
+	TUI_UDATA;
+	uint32_t flags = TUI_ALTERNATE;
+
+	for (size_t i = 2; i < lua_gettop(L); i++){
+		uint32_t val = luaL_checkint(L, i);
+		if (val && (val & (val - 1)) == 0){
+			flags |= val;
+		}
+		else {
+			luaL_error(L, "bad flag value (2^n, n >= 1)");
+		}
+	}
+
+	arcan_tui_set_flags(ib->tui, flags);
 	return 0;
 }
 
 static int color_set(lua_State* L)
 {
-	TUI_WNDDATA;
+	TUI_UDATA;
 	uint8_t dst[3] = {
-		luaL_checknumber(L, 3),
-		luaL_checknumber(L, 4),
-		luaL_checknumber(L, 5)
+		luaL_checkint(L, 3),
+		luaL_checkint(L, 4),
+		luaL_checkint(L, 5)
 	};
-	arcan_tui_set_color(ib->tui, luaL_checknumber(L, 2), dst);
+	arcan_tui_set_color(ib->tui, luaL_checkint(L, 2), dst);
 	return 0;
 }
 
 static int alert(lua_State* L)
 {
-	TUI_WNDDATA;
+	TUI_UDATA;
 	arcan_tui_message(ib->tui, TUI_MESSAGE_ALERT, luaL_checkstring(L, 2));
 	return 0;
 }
 
 static int notification(lua_State* L)
 {
-	TUI_WNDDATA;
+	TUI_UDATA;
 	arcan_tui_message(ib->tui, TUI_MESSAGE_NOTIFICATION, luaL_checkstring(L, 2));
 	return 0;
 }
 
 static int failure(lua_State* L)
 {
-	TUI_WNDDATA;
+	TUI_UDATA;
 	arcan_tui_message(ib->tui, TUI_MESSAGE_FAILURE, luaL_checkstring(L, 2));
 	return 0;
 }
 
 static int refresh(lua_State* L)
 {
-	TUI_WNDDATA;
+	TUI_UDATA;
 
 /* primary blocks processing on failure */
 	int rc = arcan_tui_refresh(ib->tui);
@@ -1106,9 +1224,16 @@ static int announce_io(lua_State* L)
 	return 0;
 }
 
+static int resetlabels(lua_State* L)
+{
+	TUI_UDATA;
+	arcan_tui_reset_labels(ib->tui);
+	return 0;
+}
+
 static int request_io(lua_State* L)
 {
-	TUI_WNDDATA;
+	TUI_UDATA;
 	const char* input = luaL_optstring(L, 2, "");
 	const char* output = luaL_optstring(L, 3, "");
 	arcan_tui_announce_io(ib->tui, true, input, output);
@@ -1117,15 +1242,26 @@ static int request_io(lua_State* L)
 
 static int statesize(lua_State* L)
 {
-	TUI_WNDDATA;
-	size_t state_sz = luaL_checknumber(L, 2);
+	TUI_UDATA;
+	size_t state_sz = luaL_checkint(L, 2);
 	arcan_tui_statesize(ib->tui, state_sz);
+	return 0;
+}
+
+static int contentsize(lua_State* L)
+{
+	TUI_UDATA;
+	size_t row_ofs = luaL_checkint(L, 2);
+	size_t row_tot = luaL_checkint(L, 3);
+	size_t col_ofs = luaL_optint(L, 4, 0);
+	size_t col_tot = luaL_optint(L, 5, 0);
+	arcan_tui_content_size(ib->tui, row_ofs, row_tot, col_ofs, col_tot);
 	return 0;
 }
 
 static int revertwnd(lua_State* L)
 {
-	TUI_WNDDATA;
+	TUI_UDATA;
 	revert(L, ib);
 	return 0;
 }
@@ -1145,9 +1281,10 @@ static int readline(lua_State* L)
 {
 	TUI_WNDDATA;
 	revert(L, ib);
-	ssize_t ofs = 1;
+	ssize_t ofs = 2;
 
 	struct tui_readline_opts opts = {
+		.anchor_row = 0,
 		.n_rows = 1,
 		.margin_left = 0,
 		.margin_right = 0,
@@ -1158,20 +1295,76 @@ static int readline(lua_State* L)
 		.multiline = false,
 		.verify = NULL, /* on_readline_verify */
 		.suggest = NULL, /* on_readline_suggest */
-/* history */
 	};
 
-	if (lua_type(L, ofs) == LUA_TTABLE){
-		luaL_error(L, "readline(prompt, [table], closure) - missing table");
-		ofs++;
-	}
 	if (!lua_isfunction(L, ofs) || lua_iscfunction(L, ofs)){
-		luaL_error(L, "readline([table], closure) - missing closure");
+		luaL_error(L, "readline(closure, [table]) - missing closure");
 	}
-/* 1. grab closure, set as widget */
-/* 2. build new reference table with right metatable */
-/* 3. convert / set history */
-	return 0;
+
+/* 1. build new reference table with right metatable */
+	struct widget_meta* meta = lua_newuserdata(L, sizeof(struct widget_meta));
+	if (!meta)
+		luaL_error(L, "couldn't allocate userdata");
+
+	*meta = (struct widget_meta){
+		.readline = {
+			.verify = LUA_NOREF,
+			.suggest = LUA_NOREF
+		}
+	};
+
+	int tbl = ofs+1;
+/* 2. extract all supported options from table */
+	if (lua_type(L, tbl) == LUA_TTABLE){
+		bool ok;
+		int vl = intblint(L, tbl, "anchor", &ok);
+		if (ok)
+			opts.anchor_row = vl;
+		vl = intblint(L, tbl, "rows", &ok);
+		if (ok)
+			opts.n_rows = vl;
+		vl = intblint(L, tbl, "margin_left", &ok);
+		if (ok && vl >= 0)
+			opts.margin_left = abs(vl);
+		vl = intblint(L, tbl, "margin_right", &ok);
+		if (ok && vl >= 0)
+			opts.margin_right = abs(vl);
+		if (intblbool(L, tbl, "cancellable"))
+			opts.allow_exit = true;
+		if (intblbool(L, tbl, "multiline"))
+			opts.multiline = true;
+		lua_getfield(L, tbl, "mask_character");
+		if (lua_isstring(L, -1)){
+			arcan_tui_utf8ucs4(lua_tostring(L, -1), &opts.mask_character);
+		}
+		lua_pop(L, 1);
+		lua_getfield(L, tbl, "suggest");
+		if (lua_isfunction(L, -1) && !lua_iscfunction(L, -1)){
+			meta->readline.suggest = luaL_ref(L, LUA_REGISTRYINDEX);
+		}
+		else
+			lua_pop(L, 1);
+		lua_getfield(L, tbl, "verify");
+		if (lua_isfunction(L, -1) && !lua_iscfunction(L, -1)){
+			meta->readline.verify = luaL_ref(L, LUA_REGISTRYINDEX);
+		}
+		else
+			lua_pop(L, 1);
+	}
+
+/* 3. grab closure, set as widget */
+	lua_pushvalue(L, ofs);
+	ib->widget_closure = luaL_ref(L, LUA_REGISTRYINDEX);
+
+	ib->widget_mode = TWND_READLINE;
+	meta->parent = ib;
+	ib->widget_meta = meta;
+	luaL_getmetatable(L, "widget_readline");
+	lua_setmetatable(L, -2);
+
+/* 4. activate the widget */
+	arcan_tui_readline_setup(ib->tui, &opts, sizeof(opts));
+	return 1;
 }
 
 static int listwnd(lua_State* L)
@@ -1214,7 +1407,137 @@ static int listwnd(lua_State* L)
 	return 0;
 }
 
-#undef TUI_WNDDATA
+static ssize_t utf8len(const char* msg)
+{
+	ssize_t res = 0;
+	uint32_t tmp;
+	while (*msg){
+		ssize_t step = arcan_tui_utf8ucs4(msg, &tmp);
+		if (-1 == step)
+			return -1;
+		msg += step;
+		res++;
+	}
+	return res;
+}
+
+static int readline_prompt(lua_State* L)
+{
+	TUI_READLINEDATA
+	struct tui_screen_attr rattr =
+		arcan_tui_defcattr(ib->tui, TUI_COL_LABEL);
+
+/* need to store the prompt somewhere in ib, and free it after */
+	size_t n_cells = 1;
+	struct tui_cell* prompt = NULL;
+
+	if (lua_type(L, 2) == LUA_TTABLE){
+		size_t nelem = lua_rawlen(L, 2);
+		size_t ltot = 0;
+
+/* find each string */
+		for (size_t i = 1; i <= nelem; i++){
+			lua_rawgeti(L, 2, i);
+			if (lua_type(L, -1) == LUA_TTABLE){
+				lua_pop(L, 1);
+			}
+			else if (lua_type(L, -1) == LUA_TSTRING){
+				const char* msg = lua_tostring(L, -1);
+				ssize_t len = utf8len(msg);
+				if (-1 == len)
+					luaL_error(L, "invalid utf8 string in prompt");
+				ltot += len;
+				lua_pop(L, 1);
+			}
+			else
+				luaL_error(L, "(attr-table or string) expected in prompt table");
+		}
+
+/* do it all again */
+		n_cells = ltot + 1;
+		prompt = malloc(n_cells * sizeof(struct tui_cell));
+		size_t celli = 0;
+		for (size_t i = 1; i <= nelem; i++){
+			lua_rawgeti(L, 2, i);
+
+/* this time around, update the attribute definition for each table */
+			if (lua_type(L, -1) == LUA_TTABLE){
+				apply_table(L, -1, &rattr);
+				lua_pop(L, 1);
+			}
+			else if (lua_type(L, -1) == LUA_TSTRING){
+				const char* msg = lua_tostring(L, -1);
+				while (*msg){
+					prompt[celli] = (struct tui_cell){
+						.attr = rattr
+					};
+					msg += arcan_tui_utf8ucs4(msg, &prompt[celli].ch);
+					celli++;
+				}
+				lua_pop(L, 1);
+			}
+		}
+		prompt[celli] = (struct tui_cell){0};
+	}
+	else if (lua_type(L, 2) == LUA_TSTRING){
+		const char* msg = lua_tostring(L, 2);
+		ssize_t len = utf8len(msg);
+		if (-1 == len)
+			luaL_error(L, "invalid utf8 string in prompt");
+
+		n_cells = len + 1;
+		prompt = malloc(n_cells * sizeof(struct tui_cell));
+
+		for (size_t i = 0; i < n_cells - 1; i++){
+			prompt[i] = (struct tui_cell){};
+			msg += arcan_tui_utf8ucs4(msg, &prompt[i].ch);
+			prompt[i].attr = rattr;
+		}
+		prompt[n_cells-1] = (struct tui_cell){};
+	}
+	else
+		luaL_error(L, "expected table or string");
+
+	arcan_tui_readline_prompt(ib->tui, prompt);
+	return 0;
+}
+
+static int readline_history(lua_State* L)
+{
+	TUI_READLINEDATA
+
+	size_t count = 0;
+	char** new_history = NULL;
+	if (lua_type(L, 2) != LUA_TTABLE){
+		luaL_error(L, "set_history(table) - missing table");
+	}
+
+	ssize_t nelem = lua_rawlen(L, 2);
+	if (nelem < 0){
+		luaL_error(L, "set_history(table) - negative length");
+	}
+
+	if (nelem){
+		new_history = malloc(nelem * sizeof(char*));
+		if (!new_history){
+			luaL_error(L, "set_history(alloc) - out of memory");
+		}
+		for (size_t i = 0; i < (size_t) nelem; i++){
+			lua_rawgeti(L, 2, i+1);
+			if (lua_type(L, -1) != LUA_TSTRING)
+				luaL_error(L, "set_history - expected string in history");
+			new_history[i] = strdup(lua_tostring(L, -1));
+			lua_pop(L, 1);
+		}
+	}
+
+	free_history(meta);
+	meta->readline.history = new_history;
+	meta->readline.history_sz = count;
+	arcan_tui_readline_history(
+		meta->parent->tui, (const char**) new_history, count);
+	return 0;
+}
 
 static int
 apiversion(lua_State *L)
@@ -1239,22 +1562,22 @@ apiversionstr(lua_State* L)
 static void register_tuimeta(lua_State* L)
 {
 	struct luaL_Reg tui_methods[] = {
+		{"alive", alive},
 		{"process", process},
 		{"refresh", refresh},
 		{"write", writeu8},
 		{"write_to", write_tou8},
 		{"set_handlers", settbl},
 		{"update_identity", setident},
-		{"mouse_forward", setmouse},
 		{"set_default", defattr},
 		{"reset", reset},
+		{"reset_labels", resetlabels},
 		{"to_clipboard", setcopy},
 		{"cursor_pos", getcursor},
 		{"new_window", reqwnd},
 		{"erase", erase_screen},
 		{"erase_region", erase_region},
 		{"scroll", wnd_scroll},
-		{"scrollhint", scrollhint},
 		{"cursor_to", cursor_to},
 		{"dimensions", screen_dimensions},
 		{"close", tuiclose},
@@ -1267,6 +1590,7 @@ static void register_tuimeta(lua_State* L)
 		{"notification", notification},
 		{"failure", failure},
 		{"state_size", statesize},
+		{"content_size", contentsize},
 		{"revert", revertwnd},
 		{"set_list", listwnd},
 		{"readline", readline},
@@ -1298,7 +1622,9 @@ static void register_tuimeta(lua_State* L)
 	struct { const char* key; int val; } flagtbl[] = {
 		{"auto_wrap", TUI_AUTO_WRAP},
 		{"hide_cursor", TUI_HIDE_CURSOR},
-		{"alternate", TUI_ALTERNATE}
+/*	{"alternate", TUI_ALTERNATE}, intentionally omitted - only support alt */
+		{"mouse", TUI_MOUSE},
+		{"mouse_full", TUI_MOUSE_FULL}
 	};
 
 	lua_pushliteral(L, "flags");
@@ -1522,6 +1848,16 @@ static void register_tuimeta(lua_State* L)
 	lua_setfield(L, -2, "data_handler");
 	lua_pop(L, 1);
 
+/* the tui-readline widget return */
+	luaL_newmetatable(L, "widget_readline");
+	lua_pushvalue(L, -1);
+	lua_setfield(L, -2, "__index");
+	lua_pushcfunction(L, readline_prompt);
+	lua_setfield(L, -2, "set_prompt");
+	lua_pushcfunction(L, readline_history);
+	lua_setfield(L, -2, "set_history");
+	lua_pop(L, 1);
+
 /*
 	luaL_newmetatable(L, "listwnd");
 	lua_pushvalue(L, -1);
@@ -1537,7 +1873,7 @@ luaopen_arcantui(lua_State* L)
 		{"APIVersion", apiversion},
 		{"APIVersionString", apiversionstr},
 		{"open", tui_open},
-		{"get_attribute", tui_attr},
+		{"attr", tui_attr},
 	};
 
 	lua_newtable(L);

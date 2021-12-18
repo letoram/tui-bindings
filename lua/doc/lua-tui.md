@@ -9,12 +9,17 @@ Lua 5.1 and above.
 See the 'examples' folder for documented examples on the available features
 and their recommended use.
 
+A note of caution while exploring the API, always make sure to check if
+something is expressed in rows and columns or as x, y positions on the grid.
+Typically positions are expressed as x,y coordinates while as dimensions are
+expressed through rows and columns.
+
 # Setting up a connection
 
 You create a new connection with the following function:
 
     tui = require('arcantui')
-		tui:open(title_string, identity_string, (option_table)) => context_table
+		wnd = tui:open(title_string, identity_string, (option_table))
 
 The title string is the immutable title of your application, while-as the
 identity string can reflect some dynamic state, e.g. the name of a file being
@@ -32,12 +37,9 @@ widgets.
 The API is almost exclusively event-driven, the handler table supports a number
 of entry points you can match to functions. The simplest pattern is thus:
 
-    all_contexts = {context}
-
-    while context:process() do
-        for i=#all_contexts,1,-1 do do
-			    all_contexts[i]:refresh()
-				end
+    wnd = tui:open("hi", "there")
+    while wnd:process() do
+			wnd:refresh()
     end
 
 Process will flush event queues and run handlers for all contexts tied to a
@@ -81,10 +83,29 @@ _close_ which takes an optional "last\_words" string that may tell the user
 *why* you decided to close. This is to communicate an error, in a normal path
 it should be left empty.
 
+## Context Flags
+
+There are some generic window controls that are provided as flags that can be
+changed with `wnd:set_flags(val1, val2, ...)` where the possible values are
+defined in the table provided in tui.flags.
+
+The supported flags are:
+
+    auto_wrap   - writes across the edge of the window will wrap to the start of
+		              the next row
+
+		mouse       - mouse input will be forwarded to the input handler and ignore
+		              the default click-drag to select
+
+		mouse_full  - like 'mouse' but the user cannot override the mouse input by
+		              holding a modifier button
+
+		hide_cursor - prevents drawing the cursor
+
 # Drawing
 
 Drawing in the TUI API means picking 'attributes' one or several unicode
-characters and writing them to a location.
+characters (utf8) and writing them to a location.
 
     mycontext:dimensions() => w, h
 
@@ -110,11 +131,11 @@ specified explicitly or implicitly by setting a default attribute.
 
 The default attribute can be set and retreived via:
 
-    set_default(attrtbl) => attrtbl
+    wnd:set_default(attrtbl) => attrtbl
 
 The attrtbl argument can be constructed via the global function:
 
-    tui_attr(optional:context, optional:table) => attrtbl
+    tui:get_attribute(tui_attr(optional:context, optional:table) => attrtbl
 
 If provided, the context argument _must_ point to a context retrieved from
 tui\_open and will take its properties from the defaults in that context.
@@ -155,8 +176,8 @@ shaped rendering, this might also cause realignment to the grid.
 There is an event handler with the name 'recolor' which provides no arguments.
 When activated, this indicates that the desired palette has changed.
 
-If you have been using the 'color\_id' method, when setting cell attributes,
-you can ignore this handler. If you use custom colors however, you will want to
+If you have been using the 'color\_id' method when setting cell attributes, you
+can ignore this handler. If you use custom colors however, you will want to
 pick colors that match the primary, secondary, background colors.
 
 The possible values for index are provided in the global lookup table
@@ -168,23 +189,23 @@ The possible values for index are provided in the global lookup table
 
 The available semantic labels in the module-global tui\_color table are:
 
-    text - expected color for generic 'text'
+    text       - expected color for generic 'text'
     background - expected color to match text background
-    highlight - color to use for dynamic emphasis rather than bold attribute
-    label - color to indicate some non-modifiable UI element or hint
-    inactive - color to indicate an element that might be interactive normally
-               but is for some reason not active or used
-    warning - color to indicate some subtle danger
-    error - color to indicate something that is dangerous or broken
-    alert - color to indicate something that needs immediate attention
-    primary - primary color for normal output, can be used to pick matching
-              schemes.
-    secondary - secondary to indicate a separate group from normal test.
-    cursor - the currently set color of the cursor, this is handled internally
-    altcursor - the currently set color in alt- scrolling mode, this is handled
-                internally
-    reference - navigation links and data references
-		ui - user-interface elements like statusbars
+    highlight  - color to use for dynamic emphasis rather than bold attribute
+    label      - color to indicate some non-modifiable UI element or hint
+    inactive   - color to indicate an element that might be interactive normally
+                 but is for some reason not active or used
+    warning    - color to indicate some subtle danger
+    error      - color to indicate something that is dangerous or broken
+    alert      - color to indicate something that needs immediate attention
+    primary    - primary color for normal output, can be used to pick matching
+                 schemes.
+    secondary  - secondary to indicate a separate group from normal test.
+    cursor     - the currently set color of the cursor, this is handled internally
+    altcursor  - the currently set color in alt- scrolling mode, this is handled
+                 internally
+    reference  - navigation links and data references
+		ui         - user-interface elements like statusbars
 
 Note that it is your responsibility to update on recolor events, the backend
 does not track the semantic label associated with some cell. This is one of the
@@ -207,56 +228,29 @@ in.
 
 ## Scrolling
 
-In normal mode, the drawing engine can usually figure out if the contents move
-uniformly in one direction and another. Depending on underlying user
-preferences, this contents can then be drawn in gradually, reducing eyestrain
-when having large cell sizes. Be sure to indicate 'margin' areas in normal mode
-where there is rows at the edges that should be ignored.
+If there is more content than what can be shown on the screen, it is recommended
+that you provide controls for seeking and for indicating roughly how much content
+there is. This allows the lower layers of the stack to provide decorations that
+fit user preferences and needs.
 
-In alternate mode, this is more difficult as the engine has to perform pattern
-analysis that may be prone to errors. In such cases, you are encouraged to
-manually hint that the next time refresh is called, the contents have shifted a
-number rows and columns. This is done via the following context call:
+In order for this feature to be enabled, you need to continously provide
+information about content state as it changes.
 
-    scroll_hint(x1, y1, x2, y2, dx, dy)
+    wnd:content_size(ofs_row, tot_row, [ofs_col], [tot_col])
 
-This can be called multiple times, though invalid values (x1 > x2, y1 > y2, and
-will make the next _refresh_ call block for longer as the soft scroll is
-performed. This will be interpreted as 'treat the region x1 to x2, y1 to y2 as
-a scroll of dx steps horizontally, and dy steps vertically with negative values
-towards origo in the upper left corner. Thus, the same amount of rows/columns
-should have changed at the relevant cell location.
+Where the 'ofs' specifies the number of rows and columns that come before the
+current window.
 
-## Screen State
+There are two event handlers:
 
-The active screen has a number of additional states (flags) that can be set
-which change its appearance and response to input and processing. The most
-important such flag is switching from _normal_ mode to _alternate_.
+    seek_absolute(n) - 0 <= n <= 1
+		seek_relative(row, col)
 
-A screen can be in one out of two modes, 'normal' and 'alternate'. The 'normal'
-mode has the idea of a history and is typically line-oriented. As data arrives
-that you want to present, you format it and send it out as a line. When those
-lines exceed the size of the screen, they get preserved and added to a history
-that you can scroll back to. This is suitable for a line-oriented workflow with
-a data set that incrementally grows, and is the more common mode people are
-familiar with.
+The absolute form requests that the contents is scrolled to start at 'n'
+percent completion, with 0 indiciating the beginning of all contents and 1
+at the end (subtracting the number of rows that fits the screen size).
 
-By contrast, the alternate screen is fixed and is treated more as a user
-interface and old 'full screen' applications operated with terminals in a
-similar fashion. There is no scrollback history, the management and sizing
-behavior is simpler and so on. The main difference here in regards to legacy
-text user interfaces is that we encourage the use of subwindows for
-segmentation that can be managed by some outer windowing or display system
-rather than manually faking borders and so on.
-
-Other flags are more of a convenience, e.g.
-
-RELATIVE\_ORIGIN - respects margins
-INSERT\_MODE - when writing into the screen, items on the current line will
-move to the right
-AUTO\_WRAP - when the cursor overflows the end of the screen in its writing
-direction, it will wrap to the next logical row or column.
-ALTERNATE - set alternate mode
+The relative form requests that the window is panned +- rows and +- cols.
 
 ## Screen Resizing
 
@@ -344,13 +338,12 @@ to spawn a detachable process.
 A lot of the work involved is retrieving and reacting to inputs from the user.
 The following input event handlers are present:
 
-    utf8 (string) : bool
-    key (subid, keysym, scancode, modifiers)
-    mouse_motion (relative, x, y, modifiers)
-    mouse_button (subid, x, y, modifiers)
-    label(string) : bool
-    alabel(string)
-    query_label() : bool
+    utf8 (string)  : bool
+    key            : (subid, keysym, scancode, modifiers)
+    mouse_motion   : (relative, x, y, modifiers)
+    mouse_button   : (subid, x, y, modifiers)
+    label(string)  : bool
+    query_label()  : bool
 
 Some of these act as a chain with an early out and flow from a high-level of
 abstraction to a low one. Your handler is expected to return 'true' if the event
@@ -414,12 +407,14 @@ which is also a hint as to the output language.
 
 By default, the inner implementation of TUI takes care of mouse input and uses
 it to manage select-to-copy and scrolling without any intervention. You can
-disable this behavior and receive mouse input yourself with:
+disable this behavior and receive mouse input yourself by:
 
-    mouse_forward(bool)
+    wnd:set_flags(tui.flags.mouse)
 
 When set, the corresponding mouse\_motion and mouse\_button events will be
-delivered to your set of event handlers.
+delivered to your set of event handlers. The extended flags, mouse\_full blocks
+the user from holding a modifier to access the builtin screen
+selection/clipboard action completely.
 
 # Data Transfers
 
@@ -440,6 +435,7 @@ enforced by the outer display system.
 The outer display system is then free, at any time, to provide an event to a
 state\_in event handler or a state\_out event handler, expecting you to
 pack/unpack enough state to be able to revert to an earlier state.
+
 Implementing this properly unlocks a number of desired features, e.g. device
 mobility, crash recovery, data mobility and so on. For how to deal with the
 data in a state\_in/out handler, see bchunk below.
@@ -497,7 +493,19 @@ into a normal Lua 'file' type metatable, with all the caveats that entail.
 
 # System
 
-The last category is about other system integration related features.
+The last category is about other system integration related features, that only
+indirectly contribute to the content that is to be presented.
+
+There are a few calls that can be used directly to communicate that some event
+has occured. These are:
+
+    alert(msg), notification(msg), failure(msg).
+
+The effect of these depend on the outer windowing system, and the message
+provided is expected to match the currently set geohint locale - if possible.
+
+There are also a number of system- class events that can be delivered to a
+window itself.
 
 ## Reset
 
@@ -518,11 +526,37 @@ announce any supported input/output formats.
 You can also call 'reset' on a context, but this has the effect of undoing other
 hints on bchunk, state and input\_labels.
 
+## Visibility
+
+The 'visibility' event handler is triggered whenever the window it is associated
+with changed visibility or focus state. The prototype is:
+
+    visibility(self, visible, focused)
+
+This information is intended to influence polling and rendering behaviour for
+clients where this information can be costly to produce.
+
+## Geohint
+
+The 'geohint' event handler is triggered when information about position and
+local has been provided and changed. This is to allow ISO-3166-1/ISO-639-2
+style information coupled with GPS coordinates to influence localisation.
+
+The prototype is:
+
+    geohint(self, country, language, lat, long, elev)
+
 ## Exec-State
 
 The 'exec\_state' event handler indicates if the context is changing from
 'normal' to being suspended or 'terminating'. The later is mainly important for
 subwindows where a window might be destroyed, but others keep on living.
+
+The protype is:
+
+    exec_state(self, state)
+
+With 'state' being 'suspend', 'resume', 'shutdown'.
 
 The suspend state is an indicator that calls to refresh and similar ones will
 be a waste of time until the next exec-state call has indicated that normal
@@ -536,3 +570,104 @@ There is a coarse grained timer that is enabled if you implement the 'tick'
 handler in your table. It has low resolution and low accuracy (~25Hz) and is
 meant for low maintenance periodic tasks, e.g. driving a data backup timer
 or 'blink' like UI state.
+
+# Widgets
+
+Some basic building blocks are also provided as widgets. The generic pattern
+behind them is that they act as modal state changes on a window, e.g.
+
+    wnd:readline(function(self, line) print(line); end)
+
+This would change the context to a readline state, and call the provided
+callback function when completed. This will temporarily alter the state of the
+handler table for the window, and revert back when completed. This means that
+your normal processing will be blocked until the user signals completion or,
+for some widgets, until you explicitly ask it to stop.
+
+Not all events are necessarily blocked while in this state, the actual set
+depends on which widget is being used. Trying to activate a new or same widget
+while already in a widget state is a terminal state transition -- you either
+first need to wnd:revert() it back to a regular window, or wait for the
+widget's closure to run.
+
+## Readline
+
+The purpose of readline is to provide the user with all the support needed to
+query for one or several lines of input. This includes editing, completion,
+validation, history, quick-keys and so on.
+
+To set it up, you simply call readline on the window in question:
+
+    local ref = wnd:readline(closure, [options])
+
+The closure callback will be invoked when readline is finished and provides
+the added string.
+
+There is a lot of options that can be added to readline on the other hand.
+
+The calls that are permitted on the returned reference table are:
+
+   ref:set_prompt(messagetbl)
+
+Messagetbl is an n-indexed table where each entry can be either an attrtbl
+signifying a change in attribute used, or a string of characters that the
+previous attrtbl applies to:
+
+   ref:set_prompt({"hi ", tui:attr({bold = true}), "there >"})
+
+would write "hi there >" with **there** being in bold.
+
+It is also possible to provide a completion history that the user can step
+through:
+
+  ref:set_history({"hi", "there", "you"})
+
+It is up to the caller to track/update history in order to not mix history
+domains/buffers between calls, or keep/leak sensitive information. Readline
+will index and scan this history, but will maintain a reference rather than a
+copy for performance reasons. If you modify the table, do call set\_history
+again in order to not corrupt possible indexes and search trees.
+
+The prototype for closure is:
+
+   (self, resstr)
+
+with resstr being the final user provided input, or nil if readline was
+cancelled. You can also manually cancel readline by:
+
+    wnd:revert()
+
+This widget forwards _all_ events to the established event handler, but will
+draw itself over existing content on refresh.
+
+The widget accepts a whole lot of options that change its behaviour or is used
+to query dynamic feedback. The properties in the options table can be:
+
+    int rows (1)            : number of grid rows that will be used to draw.
+		int margin_left (0)     : number of cells to pad from the left.
+		int margin_right (0)    : number of cells to pad from the right.
+    bool cancellable (true) : if the user is allowed to cancel input or not.
+    string mask_ch          : a single copdepoint that will mask input (for password entry)
+    bool multiline (false)  : if linefeed should act as completing readline.
+    int anchor_row (0)      : offset from top (>=0) or bottom (<0) where the contents will be drawn.
+
+There are also a number of callbacks that are used to provide context information
+and feedback (if provided):
+
+autocomplete(self, str) => str or nil is used to provide a single complete
+result that the user can commit to. This is used for the case where, based on
+msg, there is a desired outcome and will be drawn in the user prompt.
+
+suggest(self, str) => strtbl or nil is used to provide a tab-completion like
+set of possible inputs to step from and possibly pick, this might draw outside
+the normal anchor, or spawn a popup depending on window management preferences.
+
+verify(self, str) => or offset, msgstr is used to indicate that the current
+string is lacking in some way, e.g. can't be parsed because some content
+constraint. If a message is returned, it might be presented to the user as a
+hint to why the input currently fails.
+
+## Listwnd
+
+## Bufferwnd
+

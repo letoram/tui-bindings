@@ -1,9 +1,10 @@
 -- This example covers the use of the 'listview' window
+--
 -- state. When :set_list is called, the active set of handlers is taken over
 -- by a builtin implementation that behaves like a normal listview style
 -- component, calling a closure function when an item has been selected or the
 -- user has chosen to cancel/quit.
-
+--
 local list =
 {
 	{
@@ -29,4 +30,3 @@ end
 
 while (wnd:process()) do
 end
-

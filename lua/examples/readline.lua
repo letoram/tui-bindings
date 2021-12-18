@@ -1,0 +1,76 @@
+tui = require 'arcantui'
+
+local function
+redraw(wnd)
+	wnd:erase()
+	wnd:write_to(0, 0, "hello readline")
+end
+
+-- different kinds of readline configurations for more advanced prompts
+-- and editing controls
+local opts =
+{
+	{
+		prompt = {"split ", "into ", "multiple>"}
+	},
+	{
+		anchor = -2,
+		rows = 2,
+		margin_left = 10,
+		margin_right = 10,
+		multiline = true,
+		prompt = "some properties",
+		suggest =
+		function(self, line)
+			if line == "" then
+				return
+			end
+			return {"these", "are", "some", "options"}
+		end,
+	},
+	{
+		cancellable = true,
+		mask_character = "*",
+		prompt = "password>"
+	},
+	{
+		prompt = {
+			"formatting ",
+			tui.attr({bold = true, fc = tui.colors.alert}),
+			"with  ",
+			tui.attr({fr = 255, fg = 127, fb = 64, br = 0, bg = 0, bb = 127}),
+			"multiples: >"
+		},
+		verify =
+		function(self, line)
+			return line == "you can only write this"
+		end,
+	}
+}
+
+wnd = tui.open("hi", "", {handlers = {resized = redraw}})
+
+local lineind = 1
+local handler
+handler =
+function(self, msg)
+	print("readline-got:", msg)
+	if opts[lineind] then
+		local rl = wnd:readline(handler, opts[lineind])
+		rl:set_prompt(opts[lineind].prompt)
+		lineind = lineind + 1
+	else
+		wnd:close()
+	end
+end
+
+local rl = wnd:readline(handler, opts[lineind])
+rl:set_prompt("simple prompt# ")
+rl:set_history({"these", "are", "echoes", "of", "the", "past"})
+
+-- the alive part of the loop matters as we invoke :close from a handler
+while (wnd:process() and wnd:alive()) do
+	wnd:refresh()
+end
+
+print("no more lines to read")

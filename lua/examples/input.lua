@@ -66,7 +66,7 @@ tui.open("input", "", {
 	utf8 =
 		function(self, str)
 			self:write(str)
-			return false
+			return true
 		end,
 
 -- clipboard block of text
@@ -86,6 +86,7 @@ tui.open("input", "", {
 }
 )
 
+wnd:set_flags(tui.flags.mouse);
 assert(wnd, "tui:open failed")
 
 while (wnd:process()) do
