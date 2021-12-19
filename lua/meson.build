@@ -1,4 +1,4 @@
-project('arcantui', 'c', default_options : ['c_std=c11'])
+project('arcantui', 'c', default_options : ['c_std=gnu11'])
 shmif = dependency('arcan-shmif-tui')
 
 foreach ver : ['1', '2', '3', '4']

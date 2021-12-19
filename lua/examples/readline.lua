@@ -1,7 +1,6 @@
 tui = require 'arcantui'
 
-local function
-redraw(wnd)
+local function redraw(wnd)
 	wnd:erase()
 	wnd:write_to(0, 0, "hello readline")
 end
@@ -48,7 +47,8 @@ local opts =
 	}
 }
 
-wnd = tui.open("hi", "", {handlers = {resized = redraw}})
+wnd = tui.open("hi", "", {handlers = {resized = redraw, recolor = redraw}})
+print("wind", wnd)
 
 local lineind = 1
 local handler

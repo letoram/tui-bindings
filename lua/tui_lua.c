@@ -22,8 +22,6 @@
  *   [ ] Handover media embed
  */
 
-#define _POSIX_C_SOURCE 200809L
-
 #include <arcan_shmif.h>
 #include <arcan_tui.h>
 #include <arcan_tui_listwnd.h>
@@ -72,6 +70,12 @@ static struct tui_cbcfg shared_cbcfg = {};
 	lua_pushvalue(L, -3);
 
 #define END_HREF lua_pop(L, 1);
+
+#define RUN_CALLBACK(X, Y, Z) do {\
+	if (-1 == lua_pcall(L, (Y), (Z), 0)){\
+		luaL_error(L, lua_tostring(L, -1));\
+	}\
+} while(0);
 
 static void register_tuimeta(lua_State* L);
 static void dump_stack(lua_State* ctx)
@@ -152,7 +156,7 @@ static bool on_label(struct tui_context* T, const char* label, bool act, void* t
 {
 	SETUP_HREF("label", false);
 	lua_pushstring(L, label);
-	lua_call(L, 2, 1);
+	RUN_CALLBACK("label", 2, 1);
 	END_HREF;
 	return false;
 }
@@ -161,7 +165,7 @@ static bool on_u8(struct tui_context* T, const char* u8, size_t len, void* t)
 {
 	SETUP_HREF("utf8", false);
 		lua_pushlstring(L, u8, len);
-		lua_call(L, 2, 1);
+		RUN_CALLBACK("utf8", 2, 1);
 		bool rv = false;
 		if (lua_isnumber(L, -1))
 			rv = lua_tonumber(L, -1);
@@ -180,7 +184,7 @@ static void on_mouse(struct tui_context* T,
 		lua_pushnumber(L, x);
 		lua_pushnumber(L, y);
 		lua_pushnumber(L, modifiers);
-		lua_call(L, 5, 0);
+		RUN_CALLBACK("mouse_motion", 5, 0);
 	END_HREF;
 }
 
@@ -192,7 +196,7 @@ static void on_mouse_button(struct tui_context* T,
 		lua_pushnumber(L, x);
 		lua_pushnumber(L, y);
 		lua_pushnumber(L, modifiers);
-		lua_call(L, 5, 0);
+		RUN_CALLBACK("mouse_button", 5, 0);
 	END_HREF;
 }
 
@@ -204,7 +208,7 @@ static void on_key(struct tui_context* T, uint32_t xkeysym,
 		lua_pushnumber(L, xkeysym);
 		lua_pushnumber(L, scancode);
 		lua_pushnumber(L, mods);
-		lua_call(L, 5, 0);
+		RUN_CALLBACK("key", 5, 0);
 	END_HREF;
 }
 
@@ -217,8 +221,8 @@ static void on_misc(struct tui_context* T, const arcan_ioevent* ev, void* t)
 
 static void on_recolor(struct tui_context* T, void* t)
 {
-	SETUP_HREF("recolor", );
-		lua_call(L, 1, 0);
+	SETUP_HREF("recolor",);
+		RUN_CALLBACK("recolor", 1, 0);
 	END_HREF;
 }
 
@@ -226,7 +230,8 @@ static void on_reset(struct tui_context* T, int level, void* t)
 {
 	SETUP_HREF("reset", );
 		lua_pushnumber(L, level);
-	lua_call(L, 2, 0);
+		RUN_CALLBACK("reset", 2, 0);
+	END_HREF;
 }
 
 static int blob_close(lua_State* L)
@@ -269,7 +274,7 @@ static void on_state(struct tui_context* T, bool input, int fd, void* t)
 {
 	SETUP_HREF( (input?"state_in":"state_out"), );
 	add_blobio(L, t, input, fd);
-	lua_call(L, 2, 0);
+	RUN_CALLBACK("state_inout", 2, 0);
 	END_HREF;
 }
 
@@ -279,7 +284,7 @@ static void on_bchunk(struct tui_context* T,
 	SETUP_HREF((input ?"bchunk_in":"bchunk_out"), );
 	add_blobio(L, t, input, fd);
 	lua_pushstring(L, type);
-	lua_call(L, 3, 0);
+	RUN_CALLBACK("bchunk_inout", 3, 0);
 
 	END_HREF;
 }
@@ -302,7 +307,7 @@ static void on_apaste(struct tui_context* T,
 static void on_tick(struct tui_context* T, void* t)
 {
 	SETUP_HREF("tick",);
-		lua_call(L, 1, 0);
+		RUN_CALLBACK("tick", 1, 0);
 	END_HREF;
 }
 
@@ -312,7 +317,7 @@ static void on_utf8_paste(struct tui_context* T,
 	SETUP_HREF("paste",);
 		lua_pushlstring(L, (const char*) str, len);
 		lua_pushnumber(L, cont);
-		lua_call(L, 3, 0);
+		RUN_CALLBACK("paste", 3, 0);
 	END_HREF;
 }
 
@@ -330,7 +335,7 @@ static void on_resized(struct tui_context* T,
 		lua_pushnumber(L, row);
 		lua_pushnumber(L, neww);
 		lua_pushnumber(L, newh);
-		lua_call(L, 5, 0);
+		RUN_CALLBACK("resized", 5, 0);
 	END_HREF;
 }
 
@@ -342,7 +347,7 @@ static void on_resize(struct tui_context* T,
 		lua_pushnumber(L, row);
 		lua_pushnumber(L, neww);
 		lua_pushnumber(L, newh);
-		lua_call(L, 5, 0);
+		RUN_CALLBACK("resize", 5, 0);
 	END_HREF;
 }
 
@@ -362,7 +367,7 @@ static bool on_subwindow(struct tui_context* T,
 
 /* pcall and deref */
 	if (!new){
-		lua_call(L, 1, 0);
+		RUN_CALLBACK("subwindow_fail", 1, 0);
 		END_HREF;
 		return false;
 	}
@@ -371,14 +376,14 @@ static bool on_subwindow(struct tui_context* T,
 	struct tui_context* ctx =
 		arcan_tui_setup(new, T, &shared_cbcfg, sizeof(shared_cbcfg));
 	if (!ctx){
-		lua_call(L, 1, 0);
+		RUN_CALLBACK("subwindow_setup_fail", 1, 0);
 		END_HREF;
 		return true;
 	}
 
 	struct tui_lmeta* nud = lua_newuserdata(L, sizeof(struct tui_lmeta));
 	if (!nud){
-		lua_call(L, 1, 0);
+		RUN_CALLBACK("subwindow_ud_fail", 1, 0);
 		END_HREF;
 		return true;
 	}
@@ -391,8 +396,7 @@ static bool on_subwindow(struct tui_context* T,
 	nud->href = cb;
 
 /* missing - attach to parent and add to its context list for processing */
-
-	lua_call(L, 2, 0);
+	RUN_CALLBACK("subwindow_ok", 2, 0);
 	END_HREF;
 	return true;
 }
@@ -405,7 +409,7 @@ static bool query_label(struct tui_context* T,
 	lua_pushnumber(L, ind+1);
 	lua_pushstring(L, country);
 	lua_pushstring(L, lang);
-	lua_call(L, 4, 5);
+	RUN_CALLBACK("query_label", 4, 5);
 
 	const char* msg = luaL_optstring(L, -5, NULL);
 	const char* descr = luaL_optstring(L, -4, NULL);
@@ -441,7 +445,7 @@ static void on_geohint(struct tui_context* T, float lat,
 	lua_pushnumber(L, longitude);
 	lua_pushnumber(L, elev);
 
-	lua_call(L, 6, 0);
+	RUN_CALLBACK("geohint", 6, 0);
 	END_HREF;
 }
 
@@ -451,7 +455,7 @@ static void on_visibility(
 	SETUP_HREF("visibility",);
 		lua_pushboolean(L, visible);
 		lua_pushboolean(L, focus);
-		lua_call(L, 3, 0);
+		RUN_CALLBACK("visibility", 3, 0);
 	END_HREF;
 }
 
@@ -473,7 +477,7 @@ static void on_exec_state(struct tui_context* T, int state, void* t)
 			return;
 		break;
 		}
-	lua_call(L, 2, 0);
+		RUN_CALLBACK("exec_state", 2, 0);
 	END_HREF;
 }
 
@@ -481,7 +485,7 @@ static void on_seek_absolute(struct tui_context* T, float pct, void* t)
 {
 	SETUP_HREF("seek_absolute", );
 		lua_pushnumber(L, pct);
-		lua_pcall(L, 1, 0, 0);
+		RUN_CALLBACK("seek_absolute", 0, 0);
 	END_HREF;
 }
 
@@ -491,7 +495,7 @@ static void on_seek_relative(
 	SETUP_HREF("seek_relative", );
 		lua_pushnumber(L, rows);
 		lua_pushnumber(L, cols);
-		lua_pcall(L, 1, 0, 0);
+		RUN_CALLBACK("seek_relative", 1, 0);
 	END_HREF;
 }
 
@@ -893,7 +897,7 @@ static int tuiclose(lua_State* L)
 		return 0;
 	}\
 	lua_pushvalue(L, -3);
-	lua_call(L, 1, 0);
+	RUN_CALLBACK("destroy", 1, 0);
 
 	return 0;
 }
@@ -1020,7 +1024,7 @@ static int process(lua_State* L)
 					lua_pushnil(L);
 				}
 				revert(L, ib);
-				lua_pcall(L, 1, 0, 0);
+				RUN_CALLBACK("listwnd_ok", 2, 0);
 			}
 		}
 		break;
@@ -1041,7 +1045,7 @@ static int process(lua_State* L)
 /* Restore the context to its initial state so that the closure is allowed to
  * request a new readline request. Revert will actually free buf. */
 				revert(L, ib);
-				lua_pcall(L, 2, 0, 0);
+				RUN_CALLBACK("readline_ok", 2, 0);
 			}
 		}
 		break;
@@ -1208,7 +1212,6 @@ static int failure(lua_State* L)
 static int refresh(lua_State* L)
 {
 	TUI_UDATA;
-
 /* primary blocks processing on failure */
 	int rc = arcan_tui_refresh(ib->tui);
 	lua_pushnumber(L, rc);
@@ -1362,8 +1365,14 @@ static int readline(lua_State* L)
 	luaL_getmetatable(L, "widget_readline");
 	lua_setmetatable(L, -2);
 
-/* 4. activate the widget */
+/* 4. activate the widget - note that this will actually run callbacks
+ *    and they would assume that it is the window that is supposed to
+ *    be matched
+ */
+	lua_pushvalue(L, -4);
 	arcan_tui_readline_setup(ib->tui, &opts, sizeof(opts));
+	lua_pop(L, 1);
+
 	return 1;
 }
 
