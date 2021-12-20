@@ -629,6 +629,11 @@ static void revert(lua_State* L, struct tui_lmeta* M)
 				luaL_unref(L, LUA_REGISTRYINDEX, wm->readline.suggest);
 				M->widget_meta->readline.suggest = LUA_NOREF;
 			}
+
+/* There might be a case for actually not freeing the history in the case
+ * where we build another readline, and in that case also allow appending
+ * the current history buffer. The reason for that is simply that setting
+ * history is O(n) and converting to-from Lua space into a string table. */
 			free_history(wm);
 		}
 	break;
@@ -1536,6 +1541,7 @@ static int readline_history(lua_State* L)
 			if (lua_type(L, -1) != LUA_TSTRING)
 				luaL_error(L, "set_history - expected string in history");
 			new_history[i] = strdup(lua_tostring(L, -1));
+			count++;
 			lua_pop(L, 1);
 		}
 	}
