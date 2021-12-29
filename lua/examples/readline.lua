@@ -18,13 +18,12 @@ local opts =
 		margin_left = 10,
 		margin_right = 10,
 		multiline = true,
-		prompt = "some properties",
-		suggest =
-		function(self, line)
-			if line == "" then
-				return
+		prompt = "position+props, meta+enter to set> ",
+		verify = function(self, prefix, msg, suggest)
+			if (suggest) then
+				self:suggest({"hi", "there", "potato"})
 			end
-			return {"these", "are", "some", "options"}
+			return true
 		end,
 	},
 	{
@@ -41,14 +40,26 @@ local opts =
 			"multiples: >"
 		},
 		verify =
-		function(self, line)
-			return line == "you can only write this"
+		function(self, prefix, line)
+			print("I am in verify, run autocomplete")
+			if not string.find(line, " hi$") then
+				self:autocomplete(" hi")
+			else
+				self:autocomplete("")
+			end
+			return true
 		end,
+	},
+	{
+		prompt = "only alphanum >",
+		filter =
+		function(self, ch, len)
+			return string.match(ch, "%w") ~= nil
+		end
 	}
 }
 
 wnd = tui.open("hi", "", {handlers = {resized = redraw, recolor = redraw}})
-print("wind", wnd)
 
 local lineind = 1
 local handler
@@ -64,9 +75,9 @@ function(self, msg)
 	end
 end
 
-local rl = wnd:readline(handler, opts[lineind])
-rl:set_prompt("simple prompt# ")
+local rl = wnd:readline(handler, {})
 rl:set_history({"these", "are", "echoes", "of", "the", "past"})
+rl:set_prompt("a simple one")
 
 -- the alive part of the loop matters as we invoke :close from a handler
 while (wnd:process() and wnd:alive()) do
