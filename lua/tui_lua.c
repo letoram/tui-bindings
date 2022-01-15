@@ -7,6 +7,7 @@
  *
  * TODO:
  *   [ ] add blob-io from arcan
+ *       [ ] lua io.* FILE to blob-io
  *   [ ] add bgcopy with signalling
  *   [ ] handover exec on new window
  *   [ ] arcan_tui_wndhint support
@@ -81,7 +82,7 @@ static struct tui_cbcfg shared_cbcfg = {};
 static const char* udata_list[] = {
 	TUI_METATABLE,
 	"widget_readline",
-	"blob_asio"
+	"blob_asio",
 };
 
 /* just used for dump_stack, pos can't be relative */
@@ -385,6 +386,9 @@ static void on_resize(struct tui_context* T,
 	size_t neww, size_t newh, size_t col, size_t row, void* t)
 {
 	SETUP_HREF("resize",);
+/* same as with on_resized above */
+		if (!meta->tui)
+			meta->tui = T;
 		lua_pushnumber(L, col);
 		lua_pushnumber(L, row);
 		lua_pushnumber(L, neww);
@@ -1447,7 +1451,8 @@ static int readline(lua_State* L)
 		.mask_character = 0,
 		.multiline = false,
 		.filter_character = on_readline_filter,
-		.verify = on_readline_verify
+		.verify = on_readline_verify,
+		.tab_completion = true
 	};
 
 	if (!lua_isfunction(L, ofs) || lua_iscfunction(L, ofs)){
@@ -1486,6 +1491,8 @@ static int readline(lua_State* L)
 			opts.allow_exit = true;
 		if (intblbool(L, tbl, "multiline"))
 			opts.multiline = true;
+		if (intblbool(L, tbl, "tab_input"))
+			opts.tab_completion = false;
 		lua_getfield(L, tbl, "mask_character");
 		if (lua_isstring(L, -1)){
 			arcan_tui_utf8ucs4(lua_tostring(L, -1), &opts.mask_character);
@@ -1586,6 +1593,13 @@ static ssize_t utf8len(const char* msg)
 		res++;
 	}
 	return res;
+}
+
+static int utf8length(lua_State* L)
+{
+	const char* msg = luaL_checkstring(L, 1);
+	lua_pushinteger(L, utf8len(msg));
+	return 1;
 }
 
 static int readline_prompt(lua_State* L)
@@ -1704,10 +1718,24 @@ static int readline_suggest(lua_State* L)
 	}
 
 	free_suggest(meta);
+	const char* mode = luaL_optstring(L, 3, "word");
+	int mv = READLINE_SUGGEST_WORD;
+	if (strcasecmp(mode, "insert") == 0){
+		mv = READLINE_SUGGEST_INSERT;
+	}
+	else if (strcasecmp(mode, "word") == 0){
+		mv = READLINE_SUGGEST_WORD;
+	}
+	else if (strcasecmp(mode, "substitute") == 0){
+		mv = READLINE_SUGGEST_SUBSTITUTE;
+	}
+	else
+		luaL_error(L, "set_suggest(str:mode) expected insert, word or substitute");
+
 	meta->readline.suggest = new_suggest;
 	meta->readline.history_sz = count;
 	arcan_tui_readline_suggest(
-		meta->parent->tui, (const char**) new_suggest, count);
+		meta->parent->tui, mv, (const char**) new_suggest, count);
 
 	return 0;
 }
@@ -1795,6 +1823,73 @@ apiversionstr(lua_State* L)
 	return 1;
 }
 
+static int
+tui_tostring(lua_State* L)
+{
+	struct tui_lmeta* ib = luaL_checkudata(L, 1, TUI_METATABLE);
+	if (!ib || !ib->tui){
+		lua_pushstring(L, "tui(closed)");
+	}
+	else
+		switch (ib->widget_mode){
+		case TWND_READLINE:
+			lua_pushstring(L, "tui(readline)");
+		break;
+		case TWND_BUFWND:
+			lua_pushstring(L, "tui(bufferview)");
+		break;
+		case TWND_LINEWND:
+			lua_pushstring(L, "tui(listview)");
+		break;
+		default:
+			lua_pushstring(L, "tui(window)");
+		break;
+		}
+
+	return 1;
+}
+
+static int utf8step(lua_State* L)
+{
+/* byte position search based on start of string > 0 */
+	const char* msg = luaL_checkstring(L, 1);
+	ssize_t step = luaL_optnumber(L, 2, 1);
+	ssize_t ofs = luaL_optnumber(L, 3, 1) - 1; /* maintain lua 1-index */
+	ssize_t len = strlen(msg);
+
+	if (!len || ofs > len || ofs < 0){
+		lua_pushnumber(L, -1);
+		return 1;
+	}
+
+/* are we not aligned? */
+	while ((msg[ofs] & 0xc0) == 0x80){
+		ofs = ofs - 1;
+		if (ofs < 0){
+			lua_pushnumber(L, -1);
+			return 1;
+		}
+	}
+
+	ssize_t sign = (ssize_t)(step > 0) - (step < 0);
+	ssize_t ns = sign * step;
+
+	while (ofs >= 0 && ofs < len && ns){
+		ofs += sign;
+		while ((msg[ofs] & 0xc0) == 0x80 && ofs < len && ofs >= 0){
+			ofs += sign;
+		}
+		ns -= sign;
+	}
+
+	if (ns)
+		lua_pushnumber(L, -1);
+	else
+		lua_pushnumber(L, ofs+1);
+
+	return 1;
+}
+
 static void register_tuimeta(lua_State* L)
 {
 	struct luaL_Reg tui_methods[] = {
@@ -1830,6 +1925,8 @@ static void register_tuimeta(lua_State* L)
 		{"revert", revertwnd},
 		{"set_list", listwnd},
 		{"readline", readline},
+		{"utf8_step", utf8step},
+		{"utf8_len", utf8length}
 	};
 
 	/* will only be set if it does not already exist */
@@ -1845,6 +1942,8 @@ static void register_tuimeta(lua_State* L)
 		lua_setfield(L, -2, "__newindex");
 		lua_pushcfunction(L, collect);
 		lua_setfield(L, -2, "__gc");
+		lua_pushcfunction(L, tui_tostring);
+		lua_setfield(L, -2, "__tostring");
 	}
 	lua_pop(L, 1);
 
@@ -2077,7 +2176,6 @@ static void register_tuimeta(lua_State* L)
 	lua_setfield(L, -2, "data_handler");
 	lua_pop(L, 1);
 
-/* the tui-readline widget return */
 	luaL_newmetatable(L, "widget_readline");
 	lua_pushvalue(L, -1);
 	lua_setfield(L, -2, "__index");

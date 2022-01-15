@@ -78,6 +78,7 @@ end
 local rl = wnd:readline(handler, {})
 rl:set_history({"these", "are", "echoes", "of", "the", "past"})
 rl:set_prompt("a simple one")
+rl:suggest({"some", "things", "to", "add"})
 
 -- the alive part of the loop matters as we invoke :close from a handler
 while (wnd:process() and wnd:alive()) do
