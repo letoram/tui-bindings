@@ -19,7 +19,7 @@ expressed through rows and columns.
 You create a new connection with the following function:
 
     tui = require('arcantui')
-		wnd = tui:open(title_string, identity_string, (option_table))
+    wnd = tui:open(title_string, identity_string, (option_table))
 
 The title string is the immutable title of your application, while-as the
 identity string can reflect some dynamic state, e.g. the name of a file being
@@ -39,7 +39,7 @@ of entry points you can match to functions. The simplest pattern is thus:
 
     wnd = tui:open("hi", "there")
     while wnd:process() do
-			wnd:refresh()
+      wnd:refresh()
     end
 
 Process will flush event queues and run handlers for all contexts tied to a
@@ -92,15 +92,15 @@ defined in the table provided in tui.flags.
 The supported flags are:
 
     auto_wrap   - writes across the edge of the window will wrap to the start of
-		              the next row
+                  the next row
 
-		mouse       - mouse input will be forwarded to the input handler and ignore
-		              the default click-drag to select
+    mouse       - mouse input will be forwarded to the input handler and ignore
+                  the default click-drag to select
 
-		mouse_full  - like 'mouse' but the user cannot override the mouse input by
-		              holding a modifier button
+    mouse_full  - like 'mouse' but the user cannot override the mouse input by
+                  holding a modifier button
 
-		hide_cursor - prevents drawing the cursor
+    hide_cursor - prevents drawing the cursor
 
 # Drawing
 
@@ -153,8 +153,8 @@ The accepted fields in \_table\_ are as follows:
     bg : integer (0..255)
     bb : integer (0..255)
     id : integer
-		fg_id : integer
-		bg_id : integer
+    fg_id : integer
+    bg_id : integer
     shape_break : integer
 
 All of these, except for id and shape\_break, directly control the text drawing
@@ -205,7 +205,7 @@ The available semantic labels in the module-global tui\_color table are:
     altcursor  - the currently set color in alt- scrolling mode, this is handled
                  internally
     reference  - navigation links and data references
-		ui         - user-interface elements like statusbars
+    ui         - user-interface elements like statusbars
 
 Note that it is your responsibility to update on recolor events, the backend
 does not track the semantic label associated with some cell. This is one of the
@@ -244,7 +244,7 @@ current window.
 There are two event handlers:
 
     seek_absolute(n) - 0 <= n <= 1
-		seek_relative(row, col)
+    seek_relative(row, col)
 
 The absolute form requests that the contents is scrolled to start at 'n'
 percent completion, with 0 indiciating the beginning of all contents and 1
@@ -332,6 +332,14 @@ the display system that has a trust relationship to the requester, but the
 actual behavior is outside the scope and definition of this API. The primary
 purpose is to be able to write a TUI application that act as a shell that need
 to spawn a detachable process.
+
+# Shutting Down
+
+A window can be closed by invoking the close([msg]) method on the window, where
+[msg], if set, will convey some user-presentable error message explaining the
+reason for termination and should only be used as part of error handling.
+
+Closing the root window will also cause any subwindows to terminate.
 
 # Input
 
@@ -487,14 +495,19 @@ as they arrive. This is handled as part of the 'process' call.
 For bchunk\_out the 'data\_handler' can also take a string buffer itself,
 and sending / closing / management will be handled internally entirely.
 
-These methods are preferredas they are asynchronous and non-blocking. If you
-want, you can call the 'lua\_file' method on the blob that will transform it
-into a normal Lua 'file' type metatable, with all the caveats that entail.
+These methods are preferred they are asynchronous and non-blocking, though it
+is also possible to call read/write directly as part if the normal processing.
+
+For more information on blobio, see 'binary IO' further below.
 
 # System
 
 The last category is about other system integration related features, that only
-indirectly contribute to the content that is to be presented.
+indirectly contribute to the content that is to be presented. Some of these
+functions are not strictly part of arcan-tui but rather added to not avoid
+heavier dependencies (e.g. luaposix) but still be able to write something like
+a command-line shell or terminal emulator. These functions are covered in the
+system integration section further below.
 
 There are a few calls that can be used directly to communicate that some event
 has occured. These are:
@@ -644,12 +657,13 @@ The widget accepts a whole lot of options that change its behaviour or is used
 to query dynamic feedback. The properties in the options table can be:
 
     int rows (1)            : number of grid rows that will be used to draw.
-		int margin_left (0)     : number of cells to pad from the left.
-		int margin_right (0)    : number of cells to pad from the right.
+    int margin_left (0)     : number of cells to pad from the left.
+    int margin_right (0)    : number of cells to pad from the right.
     bool cancellable (true) : if the user is allowed to cancel input or not.
-    string mask_ch          : a single copdepoint that will mask input (for password entry)
+    string mask_character   : a single copdepoint that will mask input (for password entry)
     bool multiline (false)  : if linefeed should act as completing readline.
     int anchor_row (0)      : offset from top (>=0) or bottom (<0) where the contents will be drawn.
+    bool tab_input          : is the tab key/character permitted or used for completion.
 
 There are also a number of callbacks that are used to provide context information
 and feedback (if provided):
@@ -667,7 +681,169 @@ string is lacking in some way, e.g. can't be parsed because some content
 constraint. If a message is returned, it might be presented to the user as a
 hint to why the input currently fails.
 
+filter(self, ch, len) => true or false, used to determine if 'ch' is permitted to
+be added to the current input buffer based on what it is or the current length of
+the string.
+
 ## Listwnd
 
 ## Bufferwnd
+
+# System Integration
+
+This section covers functions that are not strictly arcan-tui but added to make
+necessary system integration features less painful when it comes to I/O,
+process creation and so on. These are still namespaced within the tui window,
+and piggyback on window resource management and processing.
+
+## IO / Process execution
+
+The TUI bindings shares non-blocking I/O implementation with open\_nonblock in
+Arcan with a few changes. One is that the blob userdata is created from calling
+open on a tui window context. This will tie the life-cycle to the root of that
+window, and asynchronous processing will be mixed in with the window
+:processing() multiplexation stage.
+
+There are multiple ways of initiating this:
+
+    local blobio = root:fopen("myfile", "w")
+
+Would create/open myfile for writing, which can then be called with read() and
+write() depending on the mode. When there is a lot of data to read, the
+source is a FIFO or other forms of streaming, it is better to attach a callback:
+
+    local data_in
+    on_data =
+    function()
+        buffer = blobio:read()
+        return true
+    end
+
+    blobio:data_handler(on_data)
+
+If the callback handler returns true, it will be re-armed, meaning that the
+function will fire again next time there is data. It is also possible to
+instead swap handler with another data\_handler call. The reason that the
+default behaviour is to drop the callback after firing is to prevent a
+live-/spin if you happen to ignore reading from the source when there is data.
+
+The read function is line-buffered by default, and will strip the triggering
+linefeed. By passing 'true' as the argument to read, it will instead provide a
+raw bytestring with as many bytes that could be read capped by an internal
+buffer size.
+
+The write function adds its argument to an outbound queue and might not write
+all of it immediately. This means that if its owning window is closed before
+the queue has been completed, pending outbound data will be lost.
+
+To prevent this, there is also an explicit flush([timeout-ms]) function that
+will not return until either all pending jobs (=true) have been completed, or
+[timeout-ms] has elapsed while trying.
+
+The normal write calls are prioritised for interactivity/responsiveness and are
+meant as a background / low- bandwidth protocol, not fast transfers of large
+amounts of data. Transfer callback/flushes may well be deferred until there is
+input to trigger it (though that happens quite often).
+
+For larger background transfers, e.g. a clipboard or bchunk event to filesystem
+transfer, bgcopy is used:
+
+    local blobio = root:bgcopy(src, dst)
+    if not blobio then
+        error("copy failed")
+    end
+
+    while (root:process() and root:alive()) do
+        if blobio then
+            local code = blobio:read(true)
+            if code then
+                if code == string.char(0) then
+                    print("bg copy completed")
+                else
+                    error("copy failed")
+                end
+                blobio = nil
+            end
+        end
+    end
+
+This will mark src/dst as closed and prevent them from being used again, and
+the returned blobio will instead be used to notify when the contents of src has
+been written to dst. When there is data to be read from blobio, the copy has
+finished or otherwise terminated.
+
+The read values from blobio behaves a little bit odd in order to not deviate
+from how it works on the C level or to define a separate userdata type. A
+negative value is written once (then the underlying signalling pipe is
+terminated) on failure.
+
+## Popen
+
+It is also possible to launch another process and have its stdio be mapped to
+individual blobios (as per Binary IO above). The following example would spawn
+a 'find /usr' in a subshell, map stdio and wait for it completion.
+
+    local in, out, err, pid = root:popen("find /usr", "r")
+
+    while (root:process() and root:alive()) do
+        local running, code = root:pwait(pid)
+        local line = in:read()
+
+        if line then
+            print(line)
+        end
+
+        if not running then
+            print("process exited with code", code)
+            break
+        end
+    end
+
+In order to build a zero-copy pipeline, you might also want the linked form:
+
+    local in, _, _, pid = wnd:popen("find /tmp", "r")
+		in, _, _, pid = wnd:popen("rev", in, "r")
+
+This would create two jobs, where the output of the first will be set to the
+input of the second. The [in] nbio argument to popen will be marked closed and
+will only be usable by the new job.
+
+## Environment and current directory
+
+Environment variables can be retrieved by calling getenv on a window, either
+for a specific key-value:
+
+    local val = wnd:getenv("PATH")
+		print("path is ", val)
+
+Or the entire current environment:
+
+    local env = wnd:getenv()
+		for key, val in pairs(env) do
+		    print(key, val)
+		end
+
+This will create a full copy of the environment, but any modification of it
+will not affect the environment of the current process.
+
+The popen function, covered above, can take a custom environment:
+
+    local in, _, _, pid = wnd:popen("echo $ME", "r", {ME = "example"})
+    while (wnd:process() and wnd:alive() and wnd:pwait(pid)) do
+		end
+		print(in:read())
+
+Setting or querying the current directory can be done through chdir:
+
+    print(wnd:chdir())
+		print(wnd:chdir("../"))
+
+This will affect calls to fopen, popen and so on. The working directory
+is tracked per window. If the chdir fails to switch directory, the current
+path will be returned, along with an error message:
+
+    local path, status = wnd:chdir("../")
+		if status then
+			print("chdir failed")
+		end
 

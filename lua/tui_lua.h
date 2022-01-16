@@ -80,6 +80,9 @@ struct tui_lmeta {
 	size_t n_subs;
 	int widget_mode;
 	struct tui_list_entry* tmplist;
+	char* cwd;
+	size_t cwd_sz;
+	int cwd_fd;
 
 	intptr_t href;
 	intptr_t tui_state;

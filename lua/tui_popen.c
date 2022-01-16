@@ -21,11 +21,15 @@
 #include <fcntl.h>
 #include <string.h>
 #include <sys/wait.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <errno.h>
 
 #include <lua.h>
 #include <lualib.h>
 #include <lauxlib.h>
 
+#include "tui_nbio.h"
 #include "tui_popen.h"
 
 /*
@@ -44,13 +48,22 @@ static int set_cloexec(int fd)
 /*
  * Runs command in another process, with full remote interaction capabilities.
  * Be aware that command is passed to sh -c, so shell expansion will occur.
- * Writing to *writefd will write to the command's stdin.  Reading from *readfd
- * will read from the command's stdout.  Reading from *errfd will read from the
- * command's stderr.  If NULL is passed for writefd, readfd, or errfd, then the
- * command's stdin, stdout, or stderr will not be changed.  Returns the child
- * PID on success, -1 on error.
+ *
+ * If stdin_fd is set to >= 0 it will be used as the command's stdin.
+ * Otherwise it will be provided through *writefd pipe pair.
+ *
+ * Writing to *writefd will write to the command's stdin.
+ *
+ * Reading from *readfd will read from the command's stdout.
+ * Reading from *errfd will read from the command's stderr.
+ *
+ * If NULL is passed for writefd, readfd, or errfd, then the command's
+ * stdin, stdout, or stderr will be mapped to dev/null.
+ *
+ * Returns the child PID on success, -1 on error.
  */
-static pid_t popen3(const char *command, int *writefd, int *readfd, int *errfd)
+static pid_t popen3(const char *command,
+	int stdin_fd, int *writefd, int *readfd, int *errfd, char** env)
 {
 	int in_pipe[2] = {-1, -1};
 	int out_pipe[2] = {-1, -1};
@@ -65,7 +78,7 @@ static pid_t popen3(const char *command, int *writefd, int *readfd, int *errfd)
 		goto error;
 	}
 
-	if(writefd && pipe(in_pipe)) {
+	if(stdin_fd == -1 && writefd && pipe(in_pipe)) {
 		perror("Error creating pipe for stdin");
 		goto error;
 	}
@@ -87,7 +100,16 @@ static pid_t popen3(const char *command, int *writefd, int *readfd, int *errfd)
 
 		case 0:
 			// Child
-			if(writefd) {
+			if (stdin_fd != -1){
+				if (dup2(stdin_fd, STDIN_FILENO) == -1){
+					perror("Error assigning stdin to child");
+					exit(-1);
+				}
+				close(stdin_fd);
+				fcntl(STDIN_FILENO,
+					F_SETFL, fcntl(F_GETFL, STDIN_FILENO) & (~O_NONBLOCK));
+			}
+			else if(writefd) {
 				close(in_pipe[1]);
 				if(dup2(in_pipe[0], STDIN_FILENO) == -1) {
 					perror("Error assigning stdin in child process");
@@ -135,7 +157,8 @@ static pid_t popen3(const char *command, int *writefd, int *readfd, int *errfd)
 				}
 			}
 
-			execl("/bin/sh", "/bin/sh", "-c", command, (char *)NULL);
+			execl("/bin/sh",
+				"/bin/sh", "-c", command, (char *)NULL, env, (char *) NULL);
 			perror("Error executing command in child process");
 			exit(-1);
 
@@ -144,6 +167,11 @@ static pid_t popen3(const char *command, int *writefd, int *readfd, int *errfd)
 			break;
 	}
 
+	if (stdin_fd != -1){
+		close(stdin_fd);
+	}
+
+/* nonblock is set on import elsewhere */
 	if(writefd) {
 		close(in_pipe[0]);
 		set_cloexec(in_pipe[1]);
@@ -163,6 +191,9 @@ static pid_t popen3(const char *command, int *writefd, int *readfd, int *errfd)
 	return pid;
 
 error:
+	if(stdin_fd >= 0){
+		close(stdin_fd);
+	}
 	if(in_pipe[0] >= 0) {
 		close(in_pipe[0]);
 	}
@@ -185,23 +216,88 @@ error:
 	return -1;
 }
 
-static void to_luafile(lua_State* L, int fd, const char* mode)
-{
-	if (-1 == fd){
-		lua_pushnil(L);
-		return;
-	}
-
-	FILE** pf = lua_newuserdata(L, sizeof(FILE*));
-	*pf = fdopen(fd, mode);
-	luaL_getmetatable(L, LUA_FILEHANDLE);
-	lua_setmetatable(L, -2);
-}
+extern char** environ;
+#if LUA_VERSION_NUM == 501
+	#define lua_rawlen(x, y) lua_objlen(x, y)
+#endif
 
 int tui_popen(lua_State* L)
 {
-	const char* command = luaL_checkstring(L, 1);
-	const char* mode = luaL_optstring(L, 2, "rwe");
+	size_t ci = 1;
+	if (lua_type(L, ci) == LUA_TUSERDATA){
+		ci++;
+	}
+
+	const char* command = luaL_checkstring(L, ci++);
+
+	int stdin_fd = -1;
+	if (lua_type(L, ci) == LUA_TUSERDATA){
+		struct nonblock_io** ib = luaL_checkudata(L, ci, "nonblockIO");
+		stdin_fd = (*ib)->fd;
+		(*ib)->fd = -1;
+
+/* we need to drop the non-blocking status here or children might fail */
+		alt_nbio_close(L, ib);
+		ci++;
+	}
+
+	const char* mode = luaL_optstring(L, ci++, "rwe");
+	char** env = environ;
+	bool free_env = false;
+
+	if (lua_type(L, ci) == LUA_TTABLE){
+		size_t count = 0;
+		lua_pushnil(L);
+
+/* One pass to count the number of valid entries, then alloc to match. */
+		while (lua_next(L, -2)){
+			int type = lua_type(L, -1);
+			int ktype = lua_type(L, -2);
+			if (ktype == LUA_TSTRING){
+				if (type == LUA_TBOOLEAN){
+					if (lua_toboolean(L, -1))
+						count++;
+				}
+				else if (type == LUA_TSTRING){
+					count++;
+				}
+			}
+			lua_pop(L, 1);
+		}
+
+		size_t nb = (count + 1) * sizeof(char*);
+		if (nb < count)
+			return 0;
+
+		env = malloc(nb);
+		lua_pushnil(L);
+		count = 0;
+		while (lua_next(L, -2)){
+			int type = lua_type(L, -1);
+			if (type == LUA_TBOOLEAN){
+				env[count] = strdup(lua_tostring(L, -2));
+			}
+			else if (type == LUA_TSTRING){
+				const char* key = lua_tostring(L, -2);
+				const char* val = lua_tostring(L, -1);
+				size_t l1 = strlen(key);
+				size_t l2 = strlen(val);
+				char* dst = malloc(l1 + l2 + 2);
+				if (dst){
+					memcpy(dst, key, l1);
+					dst[l1] = '=';
+					memcpy(&dst[l1+1], val, l2);
+					dst[l1+l2+1] = '\0';
+					env[count] = dst;
+				}
+			}
+			if (env[count])
+				count++;
+			lua_pop(L, 1);
+		}
+		env[count] = NULL;
+		free_env = true;
+	}
 
 	int sin_fd = -1;
 	int sout_fd = -1;
@@ -221,14 +317,22 @@ int tui_popen(lua_State* L)
 		serr = &serr_fd;
 
 /* need to also return the pid so that waitpid is possible */
-	pid_t pid = popen3(command, sin, sout, serr);
+	pid_t pid = popen3(command, stdin_fd, sin, sout, serr, env);
+
+/* only if env wasn't grabbed from ext-environ */
+	if (free_env){
+		for (size_t i = 0; env[i]; i++){
+			free(env[i]);
+		}
+		free(env);
+	}
 
 	if (-1 == pid)
 		return 0;
 
-	to_luafile(L, sin_fd, "w");
-	to_luafile(L, sout_fd, "r");
-	to_luafile(L, serr_fd, "r");
+	alt_nbio_import(L, sin_fd, O_WRONLY, NULL);
+	alt_nbio_import(L, sout_fd, O_RDONLY, NULL);
+	alt_nbio_import(L, serr_fd, O_RDONLY, NULL);
 	lua_pushnumber(L, pid);
 
 	return 4;
@@ -236,15 +340,19 @@ int tui_popen(lua_State* L)
 
 int tui_pid_status(lua_State* L)
 {
-	pid_t pid = luaL_checkint(L, 1);
+	size_t ci = 1;
+	if (lua_type(L, ci) == LUA_TUSERDATA){
+		ci++;
+	}
+
+	pid_t pid = luaL_checkint(L, ci);
 	int status;
 	pid_t res = waitpid(pid, &status, WNOHANG);
 	if (-1 == res){
 		lua_pushboolean(L, 0);
 		return 1;
 	}
-
-	if (status){
+	else if (res) {
 		if (WIFEXITED(status)){
 			lua_pushboolean(L, 0);
 			lua_pushnumber(L, WEXITSTATUS(status));
