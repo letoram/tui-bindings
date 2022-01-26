@@ -685,9 +685,50 @@ filter(self, ch, len) => true or false, used to determine if 'ch' is permitted t
 be added to the current input buffer based on what it is or the current length of
 the string.
 
-## Listwnd
+## Listview
 
-## Bufferwnd
+There is a built in window mode for presenting a list of options, letting the
+user select one and then returning back to the way things were. This is
+especially suitable for popup windows, but can of course be part of a regular
+one as well.
+
+To enable this, simply call listview on a window, providing a table of items
+and a callback for when the user is done.
+
+    local lv =
+        wnd:listview(list,
+            function(index)
+                 if index then
+                     print("user selected", list[index].label)
+                     return true
+                 else
+                     print("user cancelled")
+                 end
+            end
+        )
+
+The returned lv context can be used to step the current selection to arbitrary
+positions and to update individual items. Each entry in the n-indexed table
+passed as first argument is expected to have the following structure:
+
+    label    : string = user presentable string (required)
+    shortcut : string = unique character for quick-jumping to an item
+    indent   : integer = 0..n, add padding whitespace to indicate hierarchy
+
+Then there are a series of optional attributes (booleans) that can be set for
+some visual / interactive effects:
+
+    checked - use this to indicate that something is a default or active property
+    label   - can't be selected, use this to visually indicate a separation
+              between sets of items
+    separator - can't be selected, another way of separating items into groups
+    has_sub - mark that another set of items is to follow when activating
+    passive - can't be selected
+    hidden  - don't present but use in size calculations (intended to
+              toggle-on/off, use in combination with indent to provide a
+              tree-view)
+
+## Bufferview
 
 # System Integration
 
@@ -802,7 +843,7 @@ a 'find /usr' in a subshell, map stdio and wait for it completion.
 In order to build a zero-copy pipeline, you might also want the linked form:
 
     local in, _, _, pid = wnd:popen("find /tmp", "r")
-		in, _, _, pid = wnd:popen("rev", in, "r")
+    in, _, _, pid = wnd:popen("rev", in, "r")
 
 This would create two jobs, where the output of the first will be set to the
 input of the second. The [in] nbio argument to popen will be marked closed and
@@ -814,14 +855,14 @@ Environment variables can be retrieved by calling getenv on a window, either
 for a specific key-value:
 
     local val = wnd:getenv("PATH")
-		print("path is ", val)
+    print("path is ", val)
 
 Or the entire current environment:
 
     local env = wnd:getenv()
-		for key, val in pairs(env) do
-		    print(key, val)
-		end
+    for key, val in pairs(env) do
+        print(key, val)
+    end
 
 This will create a full copy of the environment, but any modification of it
 will not affect the environment of the current process.
@@ -830,20 +871,20 @@ The popen function, covered above, can take a custom environment:
 
     local in, _, _, pid = wnd:popen("echo $ME", "r", {ME = "example"})
     while (wnd:process() and wnd:alive() and wnd:pwait(pid)) do
-		end
-		print(in:read())
+    end
+    print(in:read())
 
 Setting or querying the current directory can be done through chdir:
 
     print(wnd:chdir())
-		print(wnd:chdir("../"))
+    print(wnd:chdir("../"))
 
 This will affect calls to fopen, popen and so on. The working directory
 is tracked per window. If the chdir fails to switch directory, the current
 path will be returned, along with an error message:
 
     local path, status = wnd:chdir("../")
-		if status then
-			print("chdir failed")
-		end
+    if status then
+      print("chdir failed")
+    end
 

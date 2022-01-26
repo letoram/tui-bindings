@@ -62,6 +62,10 @@ struct widget_meta {
 			char** suggest;
 			size_t suggest_sz;
 		} readline;
+		struct {
+			struct tui_list_entry* ents;
+			size_t n_ents;
+		} listview;
 	};
 };
 

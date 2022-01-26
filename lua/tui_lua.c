@@ -7,6 +7,7 @@
  *
  * TODO:
  *   [ ] handover exec on new window
+ *       [ ] with media embed
  *   [ ] arcan_tui_wndhint support
  *
  *   [ ] Add bufferwnd
@@ -83,6 +84,8 @@ static struct tui_cbcfg shared_cbcfg = {};
 static const char* udata_list[] = {
 	TUI_METATABLE,
 	"widget_readline",
+	"widget_listview",
+	"widget_bufferview",
 	"nonblockIO",
 	"nonblockIOs"
 };
@@ -174,14 +177,12 @@ static void dump_stack(lua_State* ctx)
 	}\
 
 #define TUI_LWNDDATA \
-	struct tui_lmeta* ib = luaL_checkudata(L, 1, TUI_METATABLE);\
-	if (!ib || !ib->tui || ib->widget_mode != TWND_LINEWND)\
-		luaL_error(L, "window not in linewnd state");
-
-#define TUI_BUFWNDDATA \
-	struct tui_lmeta* ib = luaL_checkudata(L, 1, TUI_METATABLE);\
-	if (!ib || !ib->tui || ib->widget_mode != TWND_BUFWND)\
-		luaL_error(L, "window not in bufferwnd state");
+	struct widget_meta* meta = luaL_checkudata(L, 1, "widget_listview");\
+	if (!meta || !meta->parent)\
+		luaL_error(L, "widget metadata freed");\
+	struct tui_lmeta* ib = meta->parent;\
+	if (!ib || !ib->tui || ib->widget_mode != TWND_LISTWND)\
+		luaL_error(L, "window not in listview state");
 
 #define TUI_READLINEDATA \
 	struct widget_meta* meta = luaL_checkudata(L, 1, "widget_readline");\
@@ -740,6 +741,10 @@ static void revert(lua_State* L, struct tui_lmeta* M)
 	break;
 	case TWND_LISTWND:
 		arcan_tui_listwnd_release(M->tui);
+		if (M->widget_meta){
+			free(M->widget_meta->listview.ents);
+			M->widget_meta->listview.ents = NULL;
+		}
 	break;
 	case TWND_BUFWND:
 		arcan_tui_bufferwnd_release(M->tui);
@@ -1298,7 +1303,7 @@ static int process(lua_State* L)
 					lua_pushnil(L);
 				}
 				revert(L, ib);
-				RUN_CALLBACK("listwnd_ok", 2, 0);
+				RUN_CALLBACK("listwnd_ok", 1, 0);
 			}
 		}
 		break;
@@ -1543,15 +1548,50 @@ static int revertwnd(lua_State* L)
 	return 0;
 }
 
-static void tbl_to_list(lua_State* L, struct tui_list_entry* base, size_t i)
+static void extract_listent(lua_State* L, struct tui_list_entry* base, size_t i)
 {
+	int attr = 0;
+	if (intblbool(L, -1, "checked")){
+		attr |= LIST_CHECKED;
+	}
+
+	if (intblbool(L, -1, "has_sub")){
+		attr |= LIST_HAS_SUB;
+	}
+
+	if (intblbool(L, -1, "separator")){
+		attr |= LIST_SEPARATOR;
+	}
+
+	if (intblbool(L, -1, "passive")){
+		attr |= LIST_PASSIVE;
+	}
+
+	if (intblbool(L, -1, "itemlabel")){
+		attr |= LIST_LABEL;
+	}
+
+	if (intblbool(L, -1, "hidden")){
+		attr |= LIST_HIDE;
+	}
+
 	base[i] = (struct tui_list_entry){
-		.label = "hi",
-		.shortcut = "a",
 		.indent = 0,
-		.attributes = 0, /* CHECKED, HAS_SUB, SEPARATOR, PASSIVE, LABEL, HIDE */
-		.tag = i
+		.attributes = attr,
+		.tag = i+1
 	};
+
+	bool ok;
+	int iv = intblint(L, -1, "indent", &ok);
+	if (ok)
+		base[i].indent = (uint8_t) iv;
+
+	lua_getfield(L, -1, "label");
+	base[i].label = strdup(luaL_checkstring(L, -1));
+	lua_pop(L, 1);
+	lua_getfield(L, -1, "shortcut");
+	base[i].shortcut = strdup(luaL_optstring(L, -1, ""));
+	lua_pop(L, 1);
 }
 
 static int readline(lua_State* L)
@@ -1659,6 +1699,65 @@ static int readline(lua_State* L)
 	return 1;
 }
 
+static int bufferwnd(lua_State* L)
+{
+	TUI_WNDDATA;
+	revert(L, ib);
+
+/* options:
+ *  read_only
+ *  allow_exit
+ *  hide_cursor
+ *
+ *  [view_mode, wrap_mode, color_mode, hex_mode]
+ *
+ *   custom_attr (callback for coloring)
+ *   commit (callback for writing)
+ */
+
+/* high level lua function to add:
+ *  completion callback
+ *  import nbio
+ */
+
+/* functions:
+ *  status (poll), part of normal process
+ *  synch (neo buffer)
+ *  seek (set position in buffer)
+ *  tell (get position)
+ */
+
+	return 0;
+}
+
+static void table_to_list(lua_State* L, struct widget_meta* M, int ind)
+{
+	int nelems = lua_rawlen(L, ind);
+	if (nelems <= 0){
+		luaL_error(L, "listview(table, closure) - table has 0 elements");
+	}
+
+	if (M->listview.ents){
+		free(M->listview.ents);
+		M->listview.ents = NULL;
+	}
+
+	struct tui_list_entry* tmplist =
+		malloc(sizeof(struct tui_list_entry) * nelems);
+
+	if (!tmplist)
+		luaL_error(L, "listview(table, closure) - couldn't store table");
+
+	for (size_t i = 0; i < nelems; i++){
+		lua_rawgeti(L, 2, i+1);
+		extract_listent(L, tmplist, i);
+		lua_pop(L, 1);
+	}
+
+	M->listview.ents = tmplist;
+	M->listview.n_ents = nelems;
+}
+
 static int listwnd(lua_State* L)
 {
 	TUI_WNDDATA;
@@ -1668,35 +1767,40 @@ static int listwnd(lua_State* L)
 
 /* take input table and closure */
 	if (lua_type(L, 2) != LUA_TTABLE){
-		luaL_error(L, "set_list(table, closure) - missing table");
+		luaL_error(L, "listview(table, closure) - missing table");
 	}
 
 	if (!lua_isfunction(L, 3) || lua_iscfunction(L, 3)){
-		luaL_error(L, "set_list(table, closure) - missing closure function");
+		luaL_error(L, "listview(table, closure) - missing closure function");
 	}
 
-	int nelems = lua_rawlen(L, 2);
-	if (nelems <= 0){
-		luaL_error(L, "set_list(table, clousure) - table has 0 elements");
-	}
+/* build new reference table with right metatable */
+	struct widget_meta* meta = lua_newuserdata(L, sizeof(struct widget_meta));
+	if (!meta)
+		luaL_error(L, "couldn't allocate userdata");
 
-	struct tui_list_entry* tmplist = malloc(
-		sizeof(struct tui_list_entry) * nelems);
+	luaL_getmetatable(L, "widget_listview");
+	lua_setmetatable(L, -2);
+	*meta = (struct widget_meta){
+		.parent = ib
+	};
 
-	for (size_t i = 0; i < nelems; i++){
-		lua_rawgeti(L, 2, i+1);
-		tbl_to_list(L, tmplist, i);
-		lua_pop(L, 1);
-	}
+/* convert table members to initial list */
+	table_to_list(L, meta, 2);
 
-	arcan_tui_listwnd_setup(ib->tui, tmplist, nelems);
 	ib->widget_mode = TWND_LISTWND;
-	ib->tmplist = tmplist;
-
+	ib->widget_meta = meta;
 	lua_pushvalue(L, 3);
 	ib->widget_closure = luaL_ref(L, LUA_REGISTRYINDEX);
 
-	return 0;
+/* switch mode and build return- userdata */
+	lua_pushvalue(L, 1);
+	arcan_tui_listwnd_setup(ib->tui, meta->listview.ents, meta->listview.n_ents);
+	lua_pop(L, 1);
+
+	lua_pushvalue(L, -1);
+	ib->widget_state = luaL_ref(L, LUA_REGISTRYINDEX);
+	return 1;
 }
 
 static ssize_t utf8len(const char* msg)
@@ -1918,6 +2022,44 @@ static int readline_history(lua_State* L)
 	arcan_tui_readline_history(
 		meta->parent->tui, (const char**) new_history, count);
 
+	return 0;
+}
+
+static int listwnd_pos(lua_State* L)
+{
+	TUI_LWNDDATA
+
+	int new = luaL_optinteger(L, 2, -1);
+	if (new > 0)
+		arcan_tui_listwnd_setpos(ib->tui, new);
+
+/* to be coherent with lua semantics, we stick to 1- indexed */
+	ssize_t pos = arcan_tui_listwnd_tell(ib->tui);
+	lua_pushnumber(L, pos+1);
+
+	return 1;
+}
+
+static int listwnd_update(lua_State* L)
+{
+	TUI_LWNDDATA
+	dump_stack(L);
+	int pos = luaL_checknumber(L, 2);
+	if (pos <= 0 || pos >= meta->listview.n_ents)
+		luaL_error(L, "listview:update(index, tbl) - index out of bounds");
+
+	pos--;
+
+	if (lua_type(L, 3) != LUA_TTABLE){
+		dump_stack(L);
+		luaL_error(L, "listview:update(index, tbl) - tbl argument bad / missing");
+	}
+
+	lua_pushvalue(L, 3);
+	extract_listent(L, meta->listview.ents, pos);
+	lua_pop(L, 1);
+
+	arcan_tui_listwnd_dirty(ib->tui);
 	return 0;
 }
 
@@ -2239,7 +2381,8 @@ static void register_tuimeta(lua_State* L)
 		{"state_size", statesize},
 		{"content_size", contentsize},
 		{"revert", revertwnd},
-		{"set_list", listwnd},
+		{"listview", listwnd},
+		{"bufferview", bufferwnd},
 		{"readline", readline},
 		{"utf8_step", utf8step},
 		{"utf8_len", utf8length},
@@ -2503,12 +2646,14 @@ static void register_tuimeta(lua_State* L)
 	lua_setfield(L, -2, "autocomplete");
 	lua_pop(L, 1);
 
-/*
-	luaL_newmetatable(L, "listwnd");
+	luaL_newmetatable(L, "widget_listview");
 	lua_pushvalue(L, -1);
 	lua_setfield(L, -2, "__index");
-	lua_pushcfunction(L, listwnd_seek);
- */
+	lua_pushcfunction(L, listwnd_pos);
+	lua_setfield(L, -2, "position");
+	lua_pushcfunction(L, listwnd_update);
+	lua_setfield(L, -2, "update");
+	lua_pop(L, 1);
 }
 
 int
