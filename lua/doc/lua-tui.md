@@ -107,17 +107,17 @@ The supported flags are:
 Drawing in the TUI API means picking 'attributes' one or several unicode
 characters (utf8) and writing them to a location.
 
-    mycontext:dimensions() => w, h
+    mycontext:dimensions() => w(cols), h(rows)
 
 Drawing is targetting a currently active output abstract screen. The abstract
 screen is a grid of cells that carry a character and optional formatting
 attributes. The screen has a cursor, which is the current position output will
 be written to unless the draw call used explicitly manipulates the cursor.
 
-    write
-    write_to
-    erase
-    erase_region
+    write(msg)
+    write_to(x, y, msg)
+    erase()
+    erase_region(x1,y1,x2,y2)
 
 For any drawing, positioning and sizing operation - make special note if the
 source call specifies an x,y position coordinate with 0,0 origo in the upper
@@ -662,8 +662,12 @@ to query dynamic feedback. The properties in the options table can be:
     bool cancellable (true) : if the user is allowed to cancel input or not.
     string mask_character   : a single copdepoint that will mask input (for password entry)
     bool multiline (false)  : if linefeed should act as completing readline.
-    int anchor_row (0)      : offset from top (>=0) or bottom (<0) where the contents will be drawn.
+    int anchor_row (0)      : start from top (>0) or bottom (<0) where the contents will be drawn.
     bool tab_input          : is the tab key/character permitted or used for completion.
+
+If the anchor row is set to 0, the widget will not try to automatically position and
+calculate boundary using anchor and margins. Instead the caller is expected to manually
+use bounding\_box(x1, y1, x2, y2) to define the active readline region.
 
 There are also a number of callbacks that are used to provide context information
 and feedback (if provided):
