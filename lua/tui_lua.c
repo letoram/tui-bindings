@@ -8,7 +8,7 @@
  * TODO:
  *   [ ] handover exec on new window
  *       [ ] with media embed
- *
+ *   [ ] detached windows
  *   notes:
  *       arcan_tui_handover_exec(T, subwnd, constraints, path, argv, env, flags)
  *       TUI_DETACH_ [process, stdin, stdout, stderr] -> pid
@@ -16,9 +16,13 @@
  *       - do we treat this as pwnd?
  *         how do we send external wndhint?
  *
+ *   [ ] subwnd req (hint + rows + cols)
  *   [ ] PUSH new_window
  *   [ ] arcan_tui_wndhint support
  *   [ ] nbio to bufferwnd?
+ *   [ ] screencopy (src, dst, ...)
+ *   [ ] tpack to buffer
+ *   [ ] tunpack from buffer
  *   [ ] cross-window blit
  *   [ ] apaste/vpaste does nothing - map to bchunk_in?
  *   [ ] Hasglyph
@@ -2600,6 +2604,7 @@ static void register_tuimeta(lua_State* L)
 		{"utf8_len", utf8length},
 		{"popen", popen_wrap},
 		{"pwait", tui_pid_status},
+		{"psignal", tui_pid_signal},
 		{"fopen", tui_fopen},
 		{"bgcopy", tui_fbond},
 		{"getenv", tui_getenv},

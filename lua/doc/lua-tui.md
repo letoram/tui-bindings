@@ -6,8 +6,8 @@ These bindings expose the Arcan TUI API for creating text oriented
 user-interfaces. They are provided as normal Lua-Rocks compatible modules for
 Lua 5.1 and above.
 
-See the 'examples' folder for documented examples on the available features
-and their recommended use.
+See the 'examples' folder for documented examples on the available features and
+their recommended use.
 
 A note of caution while exploring the API, always make sure to check if
 something is expressed in rows and columns or as x, y positions on the grid.
@@ -275,14 +275,18 @@ have an event handler for the _subwindow_ event.
 
 Then you can use the following function to request a new window to be created:
 
-    new_window(optional:type) => bool
+    new_window(type, closure) => bool
 
 Where type is one of (default) "tui", "popup", "handover". It returns true or
 false depending on the number of permitted subwindows and pending requests.
 
-When a subwindow has arrived, the special event handler "subwindow" is called
-with its first argument being either nil or a new context that reflects the
-subwindow to be used.
+The closure function will be called when the window has been created or if the
+request failed. This happens asynchronously as part of :process and can take
+some time before the request is actually processed. If it fails immediately
+it means that there are too many open windows already.
+
+The windows themselves are processed and refreshed as part of their parent.
+It is possibly t
 
 ## Force-Push
 
@@ -300,6 +304,43 @@ capability. There are two cases where this is relevant.
    context it is pushed into. This encourages a separation between 'error'
    outputs and 'debug' outputs and tries to deal away with command-line debug
    arguments to try and squeeze more information out of your program.
+
+These come delivered via the 'subwindow' event handler as part of the handler
+table of a window.
+
+## Handover
+
+It is possible to take a window allocation, execute a new process and have that
+process be responsible for populating the window. This requires that the new
+process supports the display system in use (typically arcan-shmif). This can
+be used to launch arcan clients from a TUI application, and embed their output
+in the window or as new windows in the context of the outer graphical shell.
+
+To do this, provide the execution information as part of the subwindow request:
+
+    new_window("handover", on_window,
+		{
+		    width = cols, [initial desired dimensions (if known)
+				height = rows,
+			  detach = boolean, [reparent the process to some system default, e.g. init]
+			  attach_row = row, [enabled embedding where the window is clipped to its parent]
+				attach_col = col,
+				path = string, [binary to execute],
+				argv = {}, [set of arguments]
+				env = {}, [environment to provide],
+				stdio = boolean, [create new nbio stdios]
+		})
+
+While the window provided in the closure is unbacked, meaning that it can be
+drawn to but drawing will have no visual effect, positioning methods (reanchor)
+can still be used if the window has been marked as embedded.
+
+## Positioning
+
+A window can be reanchored relative to its parent using the reanchor(col, row,
+[par]) method. This will move the window to the front, so if multiple windows
+are used they all have the be reanchored in the order they should be
+composited. This also applies to handover/exec:ed.
 
 ## Tui subwindow
 
@@ -734,6 +775,28 @@ some visual / interactive effects:
 
 ## Bufferview
 
+Bufferview is used to take a larger buffer string and present to the user in
+a form where they control the representation (e.g. as hex, as ascii, ...) with
+optional limited editing capabilities.
+
+To switch a window to bufferview mode:
+
+    wnd:bufferview(buffer, function_closure, [option_table])
+
+Where the closure will be called on user exit. The possible options are:
+
+    hex - default to hex view
+		read_only - disallow editing
+		block_exit - user cannot switch out of buffer mode
+		hide_cursor - don't show the navigation cursor (combine with read_only)
+
+The closure will be called as:
+
+    (wnd, [buffer])
+
+Where buffer will be set to the new edited contents (if read only mode was not
+set) and if the user commited rather than exited.
+
 # System Integration
 
 This section covers functions that are not strictly arcan-tui but added to make
@@ -849,9 +912,32 @@ In order to build a zero-copy pipeline, you might also want the linked form:
     local in, _, _, pid = wnd:popen("find /tmp", "r")
     in, _, _, pid = wnd:popen("rev", in, "r")
 
+This form of popen will perform shell expansion. If, instead, you want manual
+control over the arguments - substitute a table for the first argument:
+
+    local in, _, _, pid = wnd:popen({"find", "/tmp"}, "r")
+
 This would create two jobs, where the output of the first will be set to the
 input of the second. The [in] nbio argument to popen will be marked closed and
 will only be usable by the new job.
+
+In order to deal with terminal applications that require a working pty as input
+and output device, the special "pty" popen mode can be used. This behaves just
+like the normal popen, with the side effect that the 'screen' size need to be
+set separately. This can be done by using nbio on the 'in' or 'out' stream:
+
+    in:resize(80, 25)
+
+There is also limited process control to the pid (if still available):
+
+    wnd:pkill(pid, signal str or num)
+
+With either the raw os specific signal number, or an abstracted one from the
+set "close", "kill", "hangup", "user1", "user2", "suspend", "resume".
+
+With 'pty' mode in particular, you likely want to set a new fresh environment
+with at least the members inherited from the old: "USER', "SHELL", "HOME',
+"TERM".
 
 ## Environment and current directory
 
