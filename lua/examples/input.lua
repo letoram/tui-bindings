@@ -86,7 +86,7 @@ tui.open("input", "", {
 }
 )
 
-wnd:set_flags(tui.flags.mouse);
+wnd:set_flags(tui.flags.mouse_full);
 assert(wnd, "tui:open failed")
 
 while (wnd:process()) do
