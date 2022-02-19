@@ -114,8 +114,8 @@ screen is a grid of cells that carry a character and optional formatting
 attributes. The screen has a cursor, which is the current position output will
 be written to unless the draw call used explicitly manipulates the cursor.
 
-    write(msg)
-    write_to(x, y, msg)
+    write(msg) : bool
+    write_to(x, y, msg) : bool, cx, cy
     erase()
     erase_region(x1,y1,x2,y2)
 
@@ -705,6 +705,7 @@ to query dynamic feedback. The properties in the options table can be:
     bool multiline (false)  : if linefeed should act as completing readline.
     int anchor_row (0)      : start from top (>0) or bottom (<0) where the contents will be drawn.
     bool tab_input          : is the tab key/character permitted or used for completion.
+		bool forward_mouse      : allow other mouse input event handlers to be exposed
 
 If the anchor row is set to 0, the widget will not try to automatically position and
 calculate boundary using anchor and margins. Instead the caller is expected to manually
@@ -839,6 +840,9 @@ The read function is line-buffered by default, and will strip the triggering
 linefeed. By passing 'true' as the argument to read, it will instead provide a
 raw bytestring with as many bytes that could be read capped by an internal
 buffer size.
+
+The returned lines will have any trailing linefeed stripped by default. To
+change this behaviour, call nbio:lf\_strip(true | false) on the stream.
 
 The write function adds its argument to an outbound queue and might not write
 all of it immediately. This means that if its owning window is closed before
