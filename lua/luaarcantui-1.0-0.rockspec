@@ -20,7 +20,7 @@ build = {
     type = "builtin",
     modules = {
         arcantui = {
-            sources = { "tui_lua.c", "tui_nbio.c", "tui_popen.c" },
+            sources = { "tui_lua.c", "nbio.c", "tui_popen.c" },
             libraries = { "arcan_tui" },
 -- no way to just use pkg-tool?
             libdirs = {"/usr/local/lib", "/usr/lib"},

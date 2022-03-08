@@ -16,4 +16,4 @@ endif
 thread = dependency('threads')
 cc = meson.get_compiler('c')
 math = cc.find_library('m', required : false)
-shared_library('arcantui', ['tui_lua.c', 'tui_nbio.c', 'tui_popen.c'], install : true, install_dir: luadir, name_prefix: '', dependencies : [shmif, math, thread, lua])
+shared_library('arcantui', ['tui_lua.c', 'nbio.c', 'tui_popen.c'], install : true, install_dir: luadir, name_prefix: '', dependencies : [shmif, math, thread, lua])

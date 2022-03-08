@@ -275,18 +275,35 @@ have an event handler for the _subwindow_ event.
 
 Then you can use the following function to request a new window to be created:
 
-    new_window(type, closure) => bool
+    new_window(type, closure, [hintstr]) => bool
 
-Where type is one of (default) "tui", "popup", "handover". It returns true or
-false depending on the number of permitted subwindows and pending requests.
+Where type is one of (default) "tui", "popup", "handover" and "virtual". It
+returns true or false depending on the number of permitted subwindows and
+pending requests.
 
 The closure function will be called when the window has been created or if the
 request failed. This happens asynchronously as part of :process and can take
 some time before the request is actually processed. If it fails immediately
 it means that there are too many open windows already.
 
-The windows themselves are processed and refreshed as part of their parent.
-It is possibly t
+The windows themselves are processed and refreshed as part of their parent,
+although it is possible to explicitly process and refresh a subtree.
+
+A virtual, 'detached' window is a bit special in that it will always go through
+(unless OOM), but has no working external connection - it can be used as a
+scratch store, for testing and for building tpack buffers.
+
+How the window should behave in a managed setting can also be provided though
+the hintstr, which can be a split-direction, join-direction, tab or embed
+and the 'direction' being t,l,d or r. The split will cut the source window
+in half along one axis, while join will merely create the new window and
+position it relative to the source window.
+
+An embedded window will lack decorations of its own, and will take anchor hints
+as to where in the source window it should 'attach'. It cannot restack above or
+below, and it cannot reparent.
+
+A tabbed window can neither restack nor anchor.
 
 ## Force-Push
 
@@ -316,63 +333,52 @@ process supports the display system in use (typically arcan-shmif). This can
 be used to launch arcan clients from a TUI application, and embed their output
 in the window or as new windows in the context of the outer graphical shell.
 
-To do this, provide the execution information as part of the subwindow request:
+To do this, request a subwindow as before:
 
-    new_window("handover", on_window,
-		{
-		    width = cols, [initial desired dimensions (if known)
-				height = rows,
-			  detach = boolean, [reparent the process to some system default, e.g. init]
-			  attach_row = row, [enabled embedding where the window is clipped to its parent]
-				attach_col = col,
-				path = string, [binary to execute],
-				argv = {}, [set of arguments]
-				env = {}, [environment to provide],
-				stdio = boolean, [create new nbio stdios]
-		})
+    root:new_window("handover", on_window)
 
-While the window provided in the closure is unbacked, meaning that it can be
-drawn to but drawing will have no visual effect, positioning methods (reanchor)
-can still be used if the window has been marked as embedded.
+In the new handler, you have access to another method that can only be called
+on the new pending window:
 
-## Positioning
+    function on_window(wnd)
+		    if not wnd then
+				    print("allocation failed")
+				    return
+				end
+				wnd:phandover("/usr/bin/afsrv_terminal", "")
+		end
 
-A window can be reanchored relative to its parent using the reanchor(col, row,
-[par]) method. This will move the window to the front, so if multiple windows
-are used they all have the be reanchored in the order they should be
-composited. This also applies to handover/exec:ed.
+While control over the underlying display primitives will be passed on to the
+handover process, wnd is still valid as a virtual window with no bound backing
+store. Hierarchy restacking and positioning controls can still be applied, and
+it is likely that more controls such as input injection will be permitted in
+the future.
 
-## Tui subwindow
+Just like popen, phandover allows more arguments to be passed:
 
-This act as just another window, but with its life-span, processing and refresh
-cycle tied to that of its parent and thus needs no extra work for multiplexing.
+    wnd:phandover(path, mode, [argv], [env])
 
-It also gets another hinting feature,
+With mode being 'rwe', 'r', 'w', 'e', 'rw', 're' or 'we' depending on if you
+want stdin, stdout or stderr mapped:
 
-    spatial_hint(direction)
+   local in, out, err, pid = wnd:phandover("/usr/bin/afsrv_terminal", "rwe")
 
-where direction is one of the 8 corners (n, nw, w, sw, s, se, e, ne) and is a
-hint to the outer window management system (if any) that relative window
-positioning should be biased in that direction.
+## Hinting
 
-## Popup subwindow
+While it is the server side window manager that ultimately decides the actual
+window size, position and anchoring - it is possible to suggest what it should
+be. This can be done with:
 
-The "popup" subwindow is a more common occurence where you want to show some
-direct- feedback visuals related to the current menu, either with input focus
-or without. When mapped, you get access to another context function:
+    wnd:hint([parent], [options])
 
-    anchor(x, y, ref_y, input_grab)
+With the options table containing:
 
-This hints that the popup should be anchored to cell @ x, y and
-sized/positioned so that it does not occlude the content row at ref\_y.
+    min_cols, max_cols,
+		min_rows, max_rows,
+		anchor_x, anchor_y
 
-## Handover subwindow
-
-The "handover" subwindow type is special and is used to create a connection to
-the display system that has a trust relationship to the requester, but the
-actual behavior is outside the scope and definition of this API. The primary
-purpose is to be able to write a TUI application that act as a shell that need
-to spawn a detachable process.
+Virtual windows are a special case here where the sizing hint will go and
+trigger a resize event.
 
 # Shutting Down
 
