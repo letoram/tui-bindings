@@ -338,10 +338,10 @@ To do this, request a subwindow as before:
     root:new_window("handover", on_window)
 
 In the new handler, you have access to another method that can only be called
-on the new pending window:
+on the parent window in the context of the new window event closure:
 
-    function on_window(wnd)
-		    if not wnd then
+    function on_window(wnd, new)
+		    if not new then
 				    print("allocation failed")
 				    return
 				end
@@ -349,10 +349,10 @@ on the new pending window:
 		end
 
 While control over the underlying display primitives will be passed on to the
-handover process, wnd is still valid as a virtual window with no bound backing
-store. Hierarchy restacking and positioning controls can still be applied, and
-it is likely that more controls such as input injection will be permitted in
-the future.
+handover process, 'new' is still valid as a virtual window with no bound
+backing store. Hierarchy restacking and positioning controls through the 'hint'
+function can still be applied, and it is likely that more controls such as
+input injection and blob transfers will be permitted in the future.
 
 Just like popen, phandover allows more arguments to be passed:
 

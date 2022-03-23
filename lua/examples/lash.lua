@@ -146,7 +146,6 @@ local function add_split(wnd, msg, cap, dst)
 end
 
 local function draw(wnd)
-	lash.dirty = false
 	wnd:erase()
 	local cols, rows = wnd:dimensions()
 	local count = #lash.message_fmt
@@ -189,7 +188,6 @@ local function add_message(wnd, msg, cols)
 	end
 
 	table.insert(lash.messages, msg)
-	lash.dirty = true
 end
 
 -- Run [name.lua] via require from HOME/.arcan/lash or XDG_CONFIG_HOME and
@@ -222,6 +220,7 @@ local function run_usershell(wnd, name)
 				if not fptr then
 					return false, msg
 				end
+				lash.scriptdir = v
 				local ok, msg = pcall(fptr)
 				if not ok then
 					msg = string.split(msg, ": ")
@@ -229,6 +228,7 @@ local function run_usershell(wnd, name)
 					for i,v in ipairs(msg) do
 						table.insert(res, string.rep("\t", i-1) .. v)
 					end
+					lash.lasterr = res
 					return false, res
 				else
 					return true
@@ -242,7 +242,7 @@ end
 
 local function finish_job(wnd, job, code, cols)
 -- it's dead, flush the output
-	while true do
+	while job.out do
 		local msg = job.out:read()
 		if not msg or #msg == 0 then
 			break
@@ -269,7 +269,7 @@ local function process_jobs(wnd)
 	for i=#lash.jobs,1 do
 		local job = lash.jobs[i]
 
-		while true do
+		while job.out do
 			local msg = job.out:read()
 			if not msg then
 				break
@@ -305,7 +305,6 @@ function fallback_handlers.resized(wnd)
 		end
 	end
 
-	lash.dirty = true
 	draw(wnd)
 end
 
@@ -319,6 +318,16 @@ function commands.shell(wnd, name)
 	local res, msg = run_usershell(wnd, name)
 	if not res then
 		return msg
+	end
+end
+
+function commands.lasterr(wnd)
+	local cols, _ = wnd:dimensions()
+
+	if lash.lasterr then
+		for _,v in ipairs(lash.lasterr) do
+			add_split(wnd, v, cols, lash.message_fmt)
+		end
 	end
 end
 
@@ -457,6 +466,7 @@ setup_window =
 function(wnd)
 	wnd:revert()
 	readline = nil
+	wnd:set_handlers(fallback_handlers)
 
 	readline =
 	wnd:readline(
@@ -484,10 +494,8 @@ local function init()
 
 	local shellname = os.getenv("LASH_SHELL") and os.getenv("LASH_SHELL") or "default"
 	local res, msg = run_usershell(lash.root, shellname)
-	lash.root:set_handlers(fallback_handlers)
--- need to cleanup lash.jobs and root-wnd state (if still alive)
-
 	setup_window(lash.root)
+
 	if not res then
 		local cols, _ = lash.root:dimensions()
 		add_message(lash.root, msg, cols)
@@ -535,9 +543,10 @@ local tokens = {
 	OP_PIPE  = 29,
 	OP_ADDR  = 30,
 	OP_RELADDR  = 31,
-	OP_STATESEP = 32,
-	OP_NOT      = 33,
-	OP_POUND    = 34,
+	OP_SYMADDR  = 32,
+	OP_STATESEP = 33,
+	OP_NOT      = 34,
+	OP_POUND    = 35,
 
 -- return result states
 	ERROR    = 40,
@@ -574,7 +583,7 @@ local simple_operator_mask = {
 ['-'] = true,
 ['/'] = true,
 [','] = true,
-['='] = true
+['='] = true,
 }
 
 local constant_ascii_a = string.byte("a")
@@ -594,13 +603,6 @@ local function issymch(state, ch, ofs)
 -- special character '_', num allowed unless first pos
 	if isnum(ch) or ch == "_" or ch == "." or ch == ":" then
 		return ofs > 0
-	end
-
--- special prefixes allowed on first pos
-	if ofs == 0 then
-		if ch == "$" then
-			return true
-		end
 	end
 
 -- numbers and +- are allowed on pos2 if we have $ at the beginning
@@ -631,7 +633,7 @@ function(ch, tok, state, ofs)
 -- alpha? move to symbol state
 	if issymch(state, ch, 0) then
 		state.buffer = ch
-		return lex_symbol
+		return state.simple and lex_whstr or lex_symbol
 
 -- number constant? process and switch state
 	elseif isnum(ch) then
@@ -663,11 +665,9 @@ function(ch, tok, state, ofs)
 		return lex_default
 
 	elseif operators[ch] ~= nil then
-		if state.simple then
-			if simple_operator_mask[ch] then
-				state.buffer = ch
-				return lex_whstr
-			end
+		if state.operator_mask[ch] then
+			state.buffer = ch
+			return lex_whstr
 		end
 
 -- if we have '-num' ' -num' or 'operator-num' then set state.negate
@@ -698,6 +698,9 @@ function()
 	return lex_error
 end
 
+-- used in simple mode where a lot of operators and symbols become
+-- strings instead, the only thing that terminates it is end,
+-- whitespace, matched " or a non-masked operator
 lex_whstr =
 function(ch, tok, state, ofs)
 	if not ch or #ch == 0  or ch == "\0" then
@@ -717,6 +720,12 @@ function(ch, tok, state, ofs)
 	if ch == ' ' or ch == '\t' or ch == '\n' or ch == '"' then
 		add_token(state, tok, tokens.STRING, state.buffer, ofs)
 		state.buffer = ""
+		return lex_default
+
+	elseif operators[ch] and not state.operator_mask[ch] then
+		add_token(state, tok, tokens.STRING, state.buffer, ofs)
+		state.buffer = ""
+		add_token(state, tok, tokens.OPERATOR, operators[ch], ofs)
 		return lex_default
 
 	elseif ch == '\\' then
@@ -847,8 +856,6 @@ function(ch, tok, state, ofs)
 -- we are done
 		if state.got_addr then
 			add_token(state, tok, tokens.SYMBOL, state.got_addr, ofs, string.lower(state.buffer))
-		elseif state.simple then
-			add_token(state, tok, tokens.STRING, state.buffer, ofs)
 		else
 			local lc = string.lower(state.buffer)
 			if lc == "true" then
@@ -895,13 +902,27 @@ end
 -- the simple-mode ignored number conversion and treats arithmetic
 -- operators and . as whitespace terminated strings
 lash.tokenize_command =
-function(msg, simple)
+function(msg, simple, opts)
 	local ofs = 1
 	local nofs = ofs
 	local len = #msg
 
 	local tokout = {}
 	local state = {buffer = "", simple = simple}
+
+-- allow operators vs string interpretation be controlled by the caller
+	if simple then
+		state.operator_mask = simple_operator_mask
+	else
+		state.operator_mask = {}
+	end
+
+	if opts then
+		for k,v in pairs(opts) do
+			state[k] = v
+		end
+	end
+
 	local scope = lex_default
 
 	local scopestr =
@@ -941,6 +962,5 @@ end
 init()
 while lash.root:process() do
 	process_jobs(lash.root)
-	readline:set_prompt(get_prompt(lash.root))
 	lash.root:refresh()
 end
