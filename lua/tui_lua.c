@@ -7,14 +7,9 @@
  *
  * TODO:
  *   [ ] detached (virtual) windows
+ *   [ ] bgcopy progress and controls for out-close
  *   [ ] PUSH new_window
- *   [ ] nbio to bufferwnd?
- *   [ ] screencopy (src, dst, ...)
- *   [ ] tpack to buffer
- *   [ ] tunpack from buffer
- *   [ ] cross-window blit
  *   [ ] apaste/vpaste does nothing - map to bchunk_in?
- *   [ ] Hasglyph
  */
 
 #include <arcan_shmif.h>
@@ -268,10 +263,6 @@ static struct tui_constraints get_wndhint(lua_State* L, int ind)
 {
 	struct tui_constraints res =
 	{
-		.anch_row = -1,
-		.anch_col = -1,
-		.max_rows = -1,
-		.min_rows = -1,
 		.hide = false
 	};
 
@@ -394,7 +385,7 @@ static void on_bchunk(struct tui_context* T,
 	bool input, uint64_t size, int fd, const char* type, void* t)
 {
 	SETUP_HREF((input ?"bchunk_in":"bchunk_out"), );
-		if (alt_nbio_import(L, fd, input ? O_WRONLY : O_RDONLY, NULL)){
+		if (alt_nbio_import(L, fd, input ? O_RDONLY : O_WRONLY, NULL)){
 			lua_pushstring(L, type);
 			RUN_CALLBACK("bchunk_inout", 3, 0);
 		}
@@ -1576,7 +1567,7 @@ static int alive(lua_State* L)
 
 /* correlate a bitmap of indices to the map of file descriptors to uintptr_t
  * tags, collect them in a set and forward to alt_nbio */
-static void run_bitmap(lua_State* L, int map)
+static int run_bitmap(lua_State* L, int map)
 {
 	uintptr_t set[32];
 	int count = 0;
@@ -1588,6 +1579,7 @@ static void run_bitmap(lua_State* L, int map)
 	for (int i = 0; i < count; i++){
 		alt_nbio_data_in(L, set[i]);
 	}
+	return map;
 }
 
 static void run_sub_bitmap(struct tui_lmeta* ib, int map)
@@ -1724,8 +1716,8 @@ repoll:
  * outbound job triggers we need to first cache the tags on the stack, then
  * trigger the nbio as nbio_jobs may be modified from the nbio_data call */
 	if (nbio_jobs.fdin_used && (res.bad || res.ok)){
-		run_bitmap(L, res.ok);
-		run_bitmap(L, res.bad);
+		res.ok = run_bitmap(L, res.ok);
+		res.bad = run_bitmap(L, res.bad);
 	}
 
 /* _process only multiplexes on inbound so we need to flush outbound as well */
@@ -1742,7 +1734,7 @@ repoll:
 		}
 	}
 
-	if (res.errc == TUI_ERRC_OK){
+	if (res.errc == TUI_ERRC_OK || res.errc == TUI_ERRC_BAD_FD){
 		lua_pushboolean(L, true);
 		return 1;
 	}
@@ -1751,9 +1743,6 @@ repoll:
 	switch (res.errc){
 	case TUI_ERRC_BAD_ARG:
 		lua_pushliteral(L, "bad argument");
-	break;
-	case TUI_ERRC_BAD_FD:
-		lua_pushliteral(L, "bad descriptor in set");
 	break;
 	case TUI_ERRC_BAD_CTX:
 		lua_pushliteral(L, "broken context");
@@ -2039,7 +2028,8 @@ static int readline(lua_State* L)
 		.filter_character = on_readline_filter,
 		.verify = on_readline_verify,
 		.tab_completion = true,
-		.mouse_forward = false
+		.mouse_forward = false,
+		.paste_forward = false
 	};
 
 	if (!lua_isfunction(L, ofs) || lua_iscfunction(L, ofs)){
@@ -2080,8 +2070,10 @@ static int readline(lua_State* L)
 			opts.multiline = true;
 		if (intblbool(L, tbl, "tab_input"))
 			opts.tab_completion = false;
-		if (intblbool(L, tbl, "forward_mouse"))
-			opts.mouse_forward = true;
+
+		opts.mouse_forward = intblbool(L, tbl, "forward_mouse");
+		opts.paste_forward = intblbool(L, tbl, "forward_paste");
+
 		lua_getfield(L, tbl, "mask_character");
 		if (lua_isstring(L, -1)){
 			arcan_tui_utf8ucs4(lua_tostring(L, -1), &opts.mask_character);
@@ -2827,8 +2819,24 @@ static int tui_fbond(lua_State* L)
 
 	sio->fd = -1;
 	dio->fd = -1;
-	alt_nbio_close(L, src);
-	alt_nbio_close(L, dst);
+
+	const char* optstr = luaL_optstring(L, 4, "");
+	int flags = 0;
+
+	if (!strchr(optstr, 'r')){
+		alt_nbio_close(L, src);
+	}
+	else
+		flags |= TUI_BGCOPY_KEEPIN;
+
+	if (!strchr(optstr, 'w')){
+		alt_nbio_close(L, dst);
+	}
+	else
+		flags |= TUI_BGCOPY_KEEPOUT;
+
+	if (strchr(optstr, 'p'))
+		flags |= TUI_BGCOPY_PROGRESS;
 
 	fcntl(pair[0], F_SETFD, fcntl(pair[0], F_GETFD) | FD_CLOEXEC);
 	fcntl(pair[1], F_SETFD, fcntl(pair[0], F_GETFD) | FD_CLOEXEC);
@@ -2836,7 +2844,7 @@ static int tui_fbond(lua_State* L)
 	struct nonblock_io* ret;
 	alt_nbio_import(L, pair[0], O_RDONLY, &ret);
 	if (ret)
-		arcan_tui_bgcopy(ib->tui, fdin, fdout, pair[1], 0);
+		arcan_tui_bgcopy(ib->tui, fdin, fdout, pair[1], flags);
 	return 1;
 }
 
@@ -2877,6 +2885,65 @@ static int tui_getenv(lua_State* L)
 	return 1;
 }
 
+static int tui_tpack(lua_State* L)
+{
+	TUI_UDATA;
+	uint8_t* buf;
+	size_t buf_sz;
+
+	if (arcan_tui_tpack(ib->tui, &buf, &buf_sz)){
+		lua_pushlstring(L, (const char*) buf, buf_sz);
+		free(buf);
+	}
+	else
+		lua_pushnil(L);
+
+	return 1;
+}
+
+static int tui_screencopy(lua_State* L)
+{
+	TUI_UDATA;
+
+/* srcwnd x1, y1, x2, y2, dstwnd [x, y] */
+
+	size_t x1 = luaL_checknumber(L, 2);
+	size_t y1 = luaL_checknumber(L, 3);
+	size_t x2 = luaL_checknumber(L, 4);
+	size_t y2 = luaL_checknumber(L, 5);
+
+	struct tui_lmeta* db = luaL_checkudata(L, 6, TUI_METATABLE);
+	if (!db || !db->tui) {
+		luaL_error(L, !ib ? "no userdata" : "no tui context on dst");
+	}
+
+	size_t dx = luaL_optnumber(L, 7, 0);
+	size_t dy = luaL_optnumber(L, 8, 0);
+
+	arcan_tui_screencopy(ib->tui, db->tui, x1, y1, x2, y2, dx, dy);
+	return 0;
+}
+
+static int tui_tunpack(lua_State* L)
+{
+	TUI_UDATA;
+	size_t len;
+	const char* buf = luaL_checklstring(L, 2, &len);
+
+	size_t rows, cols;
+	arcan_tui_dimensions(ib->tui, &rows, &cols);
+
+	size_t x = luaL_optnumber(L, 3, 0);
+	size_t y = luaL_optnumber(L, 4, 0);
+	size_t w = luaL_optnumber(L, 5, 0);
+	size_t h = luaL_optnumber(L, 6, 0);
+
+	lua_pushboolean(L,
+		arcan_tui_tunpack(ib->tui, (uint8_t*) buf, len, x, y, w, h));
+
+	return 1;
+}
+
 static int popen_wrap(lua_State* L)
 {
 	TUI_UDATA;
@@ -2885,6 +2952,35 @@ static int popen_wrap(lua_State* L)
 		chdir(ib->cwd);
 
 	return tui_popen(L);
+}
+
+static int tui_hasglyph(lua_State* L)
+{
+	TUI_UDATA;
+	uint32_t cp = 0;
+
+	if (lua_type(L, -1) == LUA_TNUMBER){
+		cp = (uint32_t) lua_tonumber(L, -1);
+	}
+	else if (lua_type(L, -1) == LUA_TSTRING){
+		const char* buf = lua_tostring(L, -1);
+		char work[4] = {0};
+
+		for (size_t i = 0; i < 4 && buf[i]; i++)
+			work[i] = buf[i];
+
+		if (-1 != arcan_tui_utf8ucs4(work, &cp)){
+			lua_pushboolean(L, false);
+			lua_pushboolean(L, false);
+			return 2;
+		}
+	}
+	else
+		luaL_error(L, "has_glyph: expected u32-cp (number) or utf8- string");
+
+	lua_pushboolean(L, arcan_tui_hasglyph(ib->tui, cp));
+	lua_pushboolean(L, true);
+	return 2;
 }
 
 static void register_tuimeta(lua_State* L)
@@ -2934,6 +3030,10 @@ static void register_tuimeta(lua_State* L)
 		{"getenv", tui_getenv},
 		{"chdir", tui_chdir},
 		{"hint", tui_wndhint},
+		{"has_glyph", tui_hasglyph},
+		{"tpack", tui_tpack},
+		{"tunpack", tui_tunpack},
+		{"copy_region", tui_screencopy}
 	};
 
 	/* will only be set if it does not already exist */
