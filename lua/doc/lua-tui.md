@@ -45,8 +45,8 @@ of entry points you can match to functions. The simplest pattern is thus:
 Process will flush event queues and run handlers for all contexts tied to a
 primary one (your connection), while refresh will only synch changes to the
 canvas for each context it is invoked on. The reason for the split is that
-there is likely other actions you might want to take, e.g. processing data from
-an external source, that would affect the current output.
+there is likely other actions you might want to take, e.g. processing data
+from an external source, that would affect the current output.
 
 The reason for the 'reverse' refresh order here is to safeguard against event
 handlers that would :close a context in response to the user closing a window
@@ -294,14 +294,19 @@ A virtual, 'detached' window is a bit special in that it will always go through
 scratch store, for testing and for building tpack buffers.
 
 How the window should behave in a managed setting can also be provided though
-the hintstr, which can be a split-direction, join-direction, tab or embed
-and the 'direction' being t,l,d or r. The split will cut the source window
-in half along one axis, while join will merely create the new window and
-position it relative to the source window.
+the hintstr, which can be a split-direction, join-direction, tab or embed,
+embed-scale or embed-synch, with the 'direction' being t,l,d or r. The split
+will cut the source window in half along one axis, while join will merely
+create the new window and position it relative to the source window.
 
 An embedded window will lack decorations of its own, and will take anchor hints
 as to where in the source window it should 'attach'. It cannot restack above or
-below, and it cannot reparent.
+below, and it cannot reparent. There are three different flavours of embedded
+depending on how the external window manager should treat source resizing. With
+'embed' it will simply crop if the source is too large, with 'scale' it will
+scale to fit with aspect, and with 'synch' the client will be instructed to
+resize, and any resize updates will be forwarded as notifications to the proxy
+window structure.
 
 A tabbed window can neither restack nor anchor.
 
@@ -736,6 +741,8 @@ hint to why the input currently fails.
 filter(self, ch, len) => true or false, used to determine if 'ch' is permitted to
 be added to the current input buffer based on what it is or the current length of
 the string.
+
+set(self, str) => nil, replace the current readline contents with str
 
 ## Listview
 

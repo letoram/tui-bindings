@@ -7,7 +7,6 @@
  *
  * TODO:
  *   [ ] detached (virtual) windows
- *   [ ] bgcopy progress and controls for out-close
  *   [ ] PUSH new_window
  *   [ ] apaste/vpaste does nothing - map to bchunk_in?
  */
@@ -199,7 +198,7 @@ static void dump_stack(lua_State* ctx)
 #define TUI_READLINEDATA \
 	struct widget_meta* meta = luaL_checkudata(L, 1, "widget_readline");\
 	if (!meta || !meta->parent)\
-		luaL_error(L, "widget metadata freed");\
+		luaL_error(L, "readline: API error, widget metadata freed");\
 	struct tui_lmeta* ib = meta->parent;\
 	if (!ib || !ib->tui || ib->widget_mode != TWND_READLINE)\
 		luaL_error(L, "window not in readline state");
@@ -617,6 +616,7 @@ static bool on_subwindow(struct tui_context* T,
 	}
 	init_lmeta(L, nud, meta);
 	nud->tui = ctx;
+	nud->embed = meta->pending[id].embed;
 
 	if (type != TUI_WND_HANDOVER){
 /* cycle- reference ourselves */
@@ -1196,8 +1196,8 @@ static int tui_wndhint(lua_State* L)
 		cons = get_wndhint(L, tbli);
 	}
 
-/* this is treated as non-mutable and set on window request */
 	cons.embed = ib->embed;
+/* this is treated as non-mutable and set on window request */
 	arcan_tui_wndhint(ib->tui, parent ? parent->tui : NULL, cons);
 	return 0;
 }
@@ -1487,6 +1487,7 @@ static int reqwnd(lua_State* L)
 				"new_window(type, closure, >...<) unexpected argument type");
 	}
 
+	int embed_fl = 0;
 	if (hintstr){
 		if (strcmp(hintstr, "split") == 0){
 			meta.hint = TUIWND_SPLIT_NONE;
@@ -1519,7 +1520,16 @@ static int reqwnd(lua_State* L)
 			meta.hint = TUIWND_TAB;
 		}
 		else if (strcmp(hintstr, "embed") == 0){
+			embed_fl = 1;
 			meta.hint = TUIWND_EMBED;
+		}
+		else if (strcmp(hintstr, "embed-scale") == 0){
+			meta.hint = TUIWND_EMBED;
+			embed_fl = 2;
+		}
+		else if (strcmp(hintstr, "embed-sync") == 0){
+			meta.hint = TUIWND_EMBED;
+			embed_fl = 3;
 		}
 		else
 			luaL_error(L,"new_window(..., >hint<) "
@@ -1547,6 +1557,7 @@ static int reqwnd(lua_State* L)
 	int bitind = ffs(~(ib->pending_mask)) - 1;
 	ib->pending[bitind].id = ref;
 	ib->pending[bitind].hint = meta.hint;
+	ib->pending[bitind].embed = embed_fl;
 	ib->pending_mask |= 1 << bitind;
 	lua_pushboolean(L, true);
 	arcan_tui_request_subwnd_ext(ib->tui,
@@ -1958,6 +1969,55 @@ static int contentsize(lua_State* L)
 	return 0;
 }
 
+static int sendkey(lua_State* L)
+{
+	TUI_UDATA;
+
+	size_t l;
+	const char* u8 = luaL_checklstring(L, 2, &l);
+
+/* rest are optional */
+	uint32_t sym = 0;
+	uint8_t scode = 0;
+	uint16_t mods = 0;
+	uint16_t sub  = 0;
+	const char* label = NULL;
+
+	size_t ind = 2;
+	while(++ind <= lua_gettop(L)){
+		if (lua_type(L, ind) == LUA_TSTRING){
+			if (label){
+				luaL_error(L, "sendkey, label provided twice");
+			}
+			label = lua_tostring(L, ind);
+		}
+		else if (lua_type(L, ind) == LUA_TNUMBER){
+			if (!sub)
+				sub = lua_tointeger(L, ind);
+			else if (!sym)
+				sym = lua_tointeger(L, ind);
+			else if (!scode)
+				scode = lua_tointeger(L, ind);
+			else if (!mods)
+				mods = lua_tointeger(L, ind);
+			else
+				luaL_error(L, "sendkey, too many arguments provided");
+		}
+		else
+			luaL_error(L, "sendkey, unexpected argument (expected number or string)");
+	}
+
+	uint8_t key[4] = {0};
+	if (l <= 4){
+		memcpy(key, u8, l);
+	}
+	else
+		luaL_error(L, "sendkey, expected single utf8 codepoint");
+
+	arcan_tui_send_key(ib->tui, key, label, sym, scode, mods, sub);
+	return 0;
+}
+
 static int revertwnd(lua_State* L)
 {
 	TUI_UDATA;
@@ -2013,7 +2073,7 @@ static void extract_listent(lua_State* L, struct tui_list_entry* base, size_t i)
 
 static int readline(lua_State* L)
 {
-	TUI_WNDDATA;
+	TUI_UDATA;
 	revert(L, ib);
 	ssize_t ofs = 2;
 
@@ -2029,7 +2089,8 @@ static int readline(lua_State* L)
 		.verify = on_readline_verify,
 		.tab_completion = true,
 		.mouse_forward = false,
-		.paste_forward = false
+		.paste_forward = false,
+		.block_builtin_bindings = false
 	};
 
 	if (!lua_isfunction(L, ofs) || lua_iscfunction(L, ofs)){
@@ -2070,6 +2131,8 @@ static int readline(lua_State* L)
 			opts.multiline = true;
 		if (intblbool(L, tbl, "tab_input"))
 			opts.tab_completion = false;
+		if (intblbool(L, tbl, "block_builtin"))
+			opts.block_builtin_bindings = true;
 
 		opts.mouse_forward = intblbool(L, tbl, "forward_mouse");
 		opts.paste_forward = intblbool(L, tbl, "forward_paste");
@@ -2491,14 +2554,68 @@ static int readline_suggest(lua_State* L)
 	return 0;
 }
 
+static int readline_get(lua_State* L)
+{
+	TUI_READLINEDATA
+	char* buf;
+	arcan_tui_readline_finished(ib->tui, &buf);
+	if (buf){
+		lua_pushstring(L, buf);
+	}
+	else {
+		lua_pushstring(L, "");
+	}
+	return 1;
+}
+
 static int readline_set(lua_State* L)
 {
 	TUI_READLINEDATA
-	const char* msg = luaL_checkstring(L, 2);
-	if (strlen(msg) == 0)
-		arcan_tui_readline_set(ib->tui, NULL);
-	else
-		arcan_tui_readline_set(ib->tui, msg);
+
+/* if a 3rd table is provided, it is expected to be [chofs, fmttbl, chofs,
+ * fmttbl] and map to arcan_tui_readline_format */
+	int ind = 2;
+
+	if (lua_type(L, ind) == LUA_TSTRING){
+		const char* msg = luaL_checkstring(L, 2);
+		if (strlen(msg) == 0)
+			arcan_tui_readline_set(ib->tui, NULL);
+		else
+			arcan_tui_readline_set(ib->tui, msg);
+		ind++;
+	}
+
+	if (lua_type(L, ind) == LUA_TTABLE){
+		ssize_t nelem = lua_rawlen(L, ind);
+		if (nelem <= 0)
+			return 0;
+
+		if (nelem % 2 != 0)
+			luaL_error(L, "readline:set(>table<) "
+				"table fmt should be {ofs, fmttbl, ofs2, fmttbl2, ...}");
+
+		size_t count = nelem / 2;
+		size_t* ofs = malloc(count * sizeof(size_t));
+		struct tui_screen_attr* attr = malloc(count * sizeof(struct tui_screen_attr));
+
+		for (size_t i = 0; i < count; i++){
+			lua_rawgeti(L, ind, i * 2);
+			if (lua_type(L, -1) != LUA_TNUMBER){
+				luaL_error(L, "readline:set(>table<) expected ch offset number");
+			}
+			ofs[i] = lua_tonumber(L, -1);
+			lua_pop(L, 1);
+
+			lua_rawgeti(L, ind, i * 2 + 1);
+			if (lua_type(L, -1) != LUA_TTABLE){
+				luaL_error(L, "readline:set(>table<) expected attribute table");
+			}
+			apply_table(L, -1, &attr[i]);
+			lua_pop(L, 1);
+		}
+
+		arcan_tui_readline_format(ib->tui, ofs, attr, count);
+	}
 
 	return 0;
 }
@@ -2969,7 +3086,7 @@ static int tui_hasglyph(lua_State* L)
 		for (size_t i = 0; i < 4 && buf[i]; i++)
 			work[i] = buf[i];
 
-		if (-1 != arcan_tui_utf8ucs4(work, &cp)){
+		if (-1 == arcan_tui_utf8ucs4(work, &cp)){
 			lua_pushboolean(L, false);
 			lua_pushboolean(L, false);
 			return 2;
@@ -3015,6 +3132,7 @@ static void register_tuimeta(lua_State* L)
 		{"failure", failure},
 		{"state_size", statesize},
 		{"content_size", contentsize},
+		{"send_key", sendkey},
 		{"revert", revertwnd},
 		{"listview", listwnd},
 		{"bufferview", bufferwnd},
@@ -3288,6 +3406,8 @@ static void register_tuimeta(lua_State* L)
 		lua_setfield(L, -2, "suggest");
 		lua_pushcfunction(L, readline_set);
 		lua_setfield(L, -2, "set");
+		lua_pushcfunction(L, readline_get);
+		lua_setfield(L, -2, "get");
 		lua_pushcfunction(L, readline_region);
 		lua_setfield(L, -2, "bounding_box");
 		lua_pushcfunction(L, readline_autocomplete);
