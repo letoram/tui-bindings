@@ -835,10 +835,13 @@ write() depending on the mode. When there is a lot of data to read, the
 source is a FIFO or other forms of streaming, it is better to attach a callback:
 
     local data_in
+    local blobio = root:fopen("myfile", "r")
+    blobio:strip_lf(true)
     on_data =
     function()
-        buffer = blobio:read()
-        return true
+        local msg, ok = blobio:read()
+        -- do something to msg
+        return ok
     end
 
     blobio:data_handler(on_data)
@@ -849,17 +852,53 @@ instead swap handler with another data\_handler call. The reason that the
 default behaviour is to drop the callback after firing is to prevent a
 live-/spin if you happen to ignore reading from the source when there is data.
 
-The read function is line-buffered by default, and will strip the triggering
-linefeed. By passing 'true' as the argument to read, it will instead provide a
-raw bytestring with as many bytes that could be read capped by an internal
-buffer size.
+This is optimised for interactivity, not for throughput. The data handler will
+be invoked as part of the normal :process() part of the event loop when there
+is data to be read or written.
+
+    nbio:read([bool unbuffered], [tbl or function(msg, eof)]) -> datastr, okbool
+
+The read function is line-buffered by default. linefeed. By passing 'true' as
+the argument to read, it will instead provide a raw bytestring with as many
+bytes that could be read capped by an internal buffer size.
 
 The returned lines will have any trailing linefeed stripped by default. To
 change this behaviour, call nbio:lf\_strip(true | false) on the stream.
 
+There is an overloaded form of read that takes a destination table that
+takes a callback:
+
+    local mytable = {"hi", read_cap = 10}
+    local ok = true
+    while (ok) do
+        _, ok = blobio:read(mytable)
+    end
+
+The destination table will have each line added to mytable in a single call
+up to a soft cap of 10 (read\_cap if set).
+
+There is also an overloaded form that takes a read callback:
+
+    blobio:read(
+        function(data, eof)
+        -- return true to stop feeding
+        end
+    )
+
+THese forms all have the pitfall that if the source is faster than the sink,
+e.g. cat /dev/zero, it will spin forever. To avoid that after some cutoff
+point, the read function can cancel out by returning true.
+
+### Writing
+
+    nbio:write(str or n-tbl, [callback(ok, oob)])
+
 The write function adds its argument to an outbound queue and might not write
 all of it immediately. This means that if its owning window is closed before
 the queue has been completed, pending outbound data will be lost.
+
+The status in number of bytes written and queued can be queried with the
+write:outqueue() => total, queued.
 
 To prevent this, there is also an explicit flush([timeout-ms]) function that
 will not return until either all pending jobs (=true) have been completed, or

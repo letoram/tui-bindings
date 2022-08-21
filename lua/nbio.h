@@ -13,15 +13,17 @@ struct io_job {
 };
 
 struct nonblock_io {
-/* in line-buffered mode, this is used for input */
-	char buf[4096];
 	bool eofm;
 	bool lfstrip;
 	off_t ofs;
 
 	int fd; /* will be read from */
 
+	size_t out_queued;
+	size_t out_count;
 	struct io_job* out_queue;
+	struct io_job** out_queue_tail;
+
 	intptr_t write_handler; /* callback when queue flushed */
 
 	mode_t mode;
@@ -31,19 +33,25 @@ struct nonblock_io {
 	bool data_rearmed;
 	intptr_t data_handler; /* callback on_data_in */
 	intptr_t ref; /* :self reference to block GC */
+
+/* in line-buffered mode, this is used for input */
+	char buf[4096];
 };
 
 /*
  * Add the metatable implementation for nonblockIO into a lua state,
  * as well as register hooks for job control.
  *
- * These hooks will be called whenever the implementation wants the a
+ * These hooks will be called whenever the implementation wants the
  * descriptor for an input or output stream to be added or removed for input
  * multiplexing. Map them to whatever poll-set is currently in use.
+ *
+ * Add or remove will be called individually for O_RDONLY and O_WRONLY
+ * for a file that is both RW, with possibly different tags for each slot
  */
 void alt_nbio_register(lua_State* ctx,
 	bool (*add)(int fd, mode_t, intptr_t tag),
-	bool (*remove)(int fd, intptr_t* out)
+	bool (*remove)(int fd, mode_t, intptr_t* out)
 );
 
 /*
