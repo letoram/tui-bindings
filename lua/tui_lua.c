@@ -19,6 +19,7 @@
 #include <arcan_tui_readline.h>
 
 #include <assert.h>
+#include <stdio.h>
 #include <stdbool.h>
 #include <fcntl.h>
 #include <lua.h>
@@ -28,6 +29,12 @@
 #include <string.h>
 #include <strings.h>
 #include <poll.h>
+
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <sys/un.h>
 
 #include "tui_lua.h"
 #include "nbio.h"
@@ -380,7 +387,8 @@ static void on_reset(struct tui_context* T, int level, void* t)
 static void on_state(struct tui_context* T, bool input, int fd, void* t)
 {
 	SETUP_HREF( (input?"state_in":"state_out"), );
-		if (alt_nbio_import(L, fd, input ? O_RDONLY : O_WRONLY, NULL)){
+		if (alt_nbio_import(
+			L, fd, input ? O_RDONLY : O_WRONLY, NULL, NULL)){
 			RUN_CALLBACK("state_inout", 2, 0);
 		}
 		else
@@ -392,7 +400,8 @@ static void on_bchunk(struct tui_context* T,
 	bool input, uint64_t size, int fd, const char* type, void* t)
 {
 	SETUP_HREF((input ?"bchunk_in":"bchunk_out"), );
-		if (alt_nbio_import(L, fd, input ? O_RDONLY : O_WRONLY, NULL)){
+		if (alt_nbio_import(
+			L, fd, input ? O_RDONLY : O_WRONLY, NULL, NULL)){
 			lua_pushstring(L, type);
 			RUN_CALLBACK("bchunk_inout", 3, 0);
 		}
@@ -556,9 +565,9 @@ static int tui_phandover(lua_State* L)
 		return 0;
 
 /* create proxy-window and return along with requested stdio */
-	alt_nbio_import(L, fds[0], O_WRONLY, NULL);
-	alt_nbio_import(L, fds[1], O_RDONLY, NULL);
-	alt_nbio_import(L, fds[2], O_RDONLY, NULL);
+	alt_nbio_import(L, fds[0], O_WRONLY, NULL, NULL);
+	alt_nbio_import(L, fds[1], O_RDONLY, NULL, NULL);
+	alt_nbio_import(L, fds[2], O_RDONLY, NULL, NULL);
 	lua_pushnumber(L, pid);
 
 	return 4;
@@ -2530,6 +2539,13 @@ static int readline_suggest(lua_State* L)
 	}
 
 	ssize_t nelem = lua_rawlen(L, index);
+	bool hint_ext = false;
+	lua_getfield(L, index, "hint");
+	if (lua_type(L, -1) == LUA_TTABLE){
+		hint_ext = true;
+	}
+	lua_pop(L, 1);
+
 	if (nelem < 0){
 		luaL_error(L, "suggest(table) - negative length");
 	}
@@ -2539,11 +2555,44 @@ static int readline_suggest(lua_State* L)
 		if (!new_suggest){
 			luaL_error(L, "set_suggest(alloc) - out of memory");
 		}
+
+/* two forms, if there is a hint_ext we need concatenate the strings
+ * with a \0 separator and run twice the number of elements. */
 		for (size_t i = 0; i < (size_t) nelem; i++){
 			lua_rawgeti(L, 2, i+1);
 			if (lua_type(L, -1) != LUA_TSTRING)
 				luaL_error(L, "set_suggest - expected string in suggest");
-			new_suggest[i] = strdup(lua_tostring(L, -1));
+			const char* a1 = lua_tostring(L, -1);
+
+/* for the hints, check if the corresponding index has a hints entry,
+ * this was chosen over using twice nelem and pack to avoid breaking
+ * backwards compatibility. */
+			if (hint_ext){
+				lua_getfield(L, index, "hint");
+				lua_rawgeti(L, -1, i+1);
+				if (lua_type(L, -1) == LUA_TSTRING){
+					const char* a2 = lua_tostring(L, -1);
+					size_t l1 = strlen(a1);
+					size_t l2 = strlen(a2);
+					if ((new_suggest[i] = malloc(l1+l2+2))){
+						memcpy(&new_suggest[i][0], a1, l1);
+						memcpy(&new_suggest[i][l1+1], a2, l2);
+						new_suggest[i][l1] = '\0';
+						new_suggest[i][l1+1+l2] = '\0';
+					}
+				}
+				else
+					new_suggest[i] = strdup(a1);
+				lua_pop(L, 2);
+			}
+			else{
+				new_suggest[i] = strdup(a1);
+				if (!new_suggest[i]){
+					free(new_suggest);
+					luaL_error(L, "set_suggest(hint, alloc) - out of memory");
+				}
+			}
+
 			count++;
 			lua_pop(L, 1);
 		}
@@ -2563,6 +2612,9 @@ static int readline_suggest(lua_State* L)
 	}
 	else
 		luaL_error(L, "set_suggest(str:mode) expected insert, word or substitute");
+
+	if (hint_ext)
+		mv |= READLINE_SUGGEST_HINT;
 
 	meta->readline.suggest = new_suggest;
 	meta->readline.suggest_sz = count;
@@ -2904,6 +2956,42 @@ static bool dequeue_nbio(int fd, mode_t mode, intptr_t* tag)
 	return found;
 }
 
+static int tui_fstatus(lua_State* L)
+{
+	TUI_UDATA;
+	const char* src = luaL_checkstring(L, 2);
+	struct stat s;
+
+#ifndef AT_EMPTY_PATH
+#define AT_EMPTY_PATH 0x1000
+#endif
+
+	if (-1 == fstatat(
+		ib->cwd_fd, src, &s, AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW)){
+		lua_pushboolean(L, false);
+		lua_pushstring(L, strerror(errno));
+		return 2;
+	}
+
+	lua_pushboolean(L, true);
+	if (S_ISDIR(s.st_mode)){
+		lua_pushstring(L, "directory");
+	}
+	else if (S_ISREG(s.st_mode)){
+		lua_pushstring(L, "file");
+	}
+	else if (S_ISFIFO(s.st_mode)){
+		lua_pushstring(L, "fifo");
+	}
+	else if (S_ISSOCK(s.st_mode)){
+		lua_pushstring(L, "socket");
+	}
+	else
+		lua_pushstring(L, "unknown");
+
+	return 2;
+}
+
 static int tui_frename(lua_State* L)
 {
 	TUI_UDATA;
@@ -2939,6 +3027,8 @@ static int tui_funlink(lua_State* L)
 	return 1;
 }
 
+/* could've re-used alt_nbio_open but the special prefixes vs. having
+ * the modestr set the desired type favoues the modestr */
 static int tui_fopen(lua_State* L)
 {
 	TUI_UDATA;
@@ -2954,8 +3044,24 @@ static int tui_fopen(lua_State* L)
 		omode = O_WRONLY;
 		flags = O_CREAT;
 	}
+
+/* the datagram socket type requires us to provide a local name,
+ * which comes with a ton of quirks - including deferred unlink */
+	else if (strcmp(mode, "unix") == 0){
+		char* unlink_fn;
+		int fd = alt_nbio_socket(name, 0, &unlink_fn);
+		if (fd != -1){
+			alt_nbio_import(L, fd, O_RDWR, NULL, &unlink_fn);
+			alt_nbio_nonblock_cloexec(fd, true);
+			return 1;
+		}
+
+		lua_pushboolean(L, false);
+		lua_pushstring(L, strerror(errno));
+		return 2;
+	}
 	else
-		luaL_error(L, "unsupported file mode, expected 'r' or 'w'");
+		luaL_error(L, "unsupported file mode, expected 'r', 'w' or 'unix'");
 
 	int	fd = openat(ib->cwd_fd, name, omode | flags, 0600);
 
@@ -2964,7 +3070,7 @@ static int tui_fopen(lua_State* L)
 		return 1;
 	}
 
-	alt_nbio_import(L, fd, omode, NULL);
+	alt_nbio_import(L, fd, omode, NULL, NULL);
 	return 1;
 }
 
@@ -3030,7 +3136,7 @@ static int tui_fbond(lua_State* L)
 	fcntl(pair[1], F_SETFD, fcntl(pair[0], F_GETFD) | FD_CLOEXEC);
 
 	struct nonblock_io* ret;
-	alt_nbio_import(L, pair[0], O_RDONLY, &ret);
+	alt_nbio_import(L, pair[0], O_RDONLY, &ret, NULL);
 	if (ret)
 		arcan_tui_bgcopy(ib->tui, fdin, fdout, pair[1], flags);
 	return 1;
@@ -3217,6 +3323,7 @@ static void register_tuimeta(lua_State* L)
 		{"fopen", tui_fopen},
 		{"funlink", tui_funlink},
 		{"frename", tui_frename},
+		{"fstatus", tui_fstatus},
 		{"bgcopy", tui_fbond},
 		{"getenv", tui_getenv},
 		{"chdir", tui_chdir},

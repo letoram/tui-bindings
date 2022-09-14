@@ -12,6 +12,7 @@
  */
 #include <stdlib.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdbool.h>
 #include <unistd.h>
 #include <errno.h>
@@ -46,7 +47,7 @@ static struct nonblock_io open_fds[LUACTX_OPEN_FILES];
 static bool (*add_job)(int fd, mode_t mode, intptr_t tag);
 static bool (*remove_job)(int fd, mode_t mode, intptr_t* out);
 
-static void set_nonblock_cloexec(int fd, bool socket)
+void alt_nbio_nonblock_cloexec(int fd, bool socket)
 {
 #ifdef __APPLE__
 	if (socket){
@@ -89,7 +90,7 @@ static int connect_trypath(const char* local, const char* remote, int type)
 /* the other option here is to allow the allocation to go through and treat
  * it as a 'reconnect on operation' in order to deal with normal failures
  * during connection as well, but start conservative */
-	set_nonblock_cloexec(fd, true);
+	alt_nbio_nonblock_cloexec(fd, true);
 
 	if (-1 == connect(fd, (struct sockaddr*) &addr_remote, sizeof(addr_remote))){
 		unlink(local);
@@ -100,7 +101,7 @@ static int connect_trypath(const char* local, const char* remote, int type)
 	return fd;
 }
 
-static int connect_stream_to(const char* path, int ns, char** out)
+int alt_nbio_socket(const char* path, int ns, char** out)
 {
 /* we still need to bind a path that we can then unlink after connection */
 	char* local_path = NULL;
@@ -109,9 +110,9 @@ static int connect_stream_to(const char* path, int ns, char** out)
 /* find a temporary name to use in the appl-temp namespace, with a fail
  * retry counter to counteract the rare collision vs. permanent problem */
 	do {
-		char tmpname[16];
+		char tmpname[32];
 		long rnd = random();
-		snprintf(tmpname, sizeof(tmpname), "_sock%ld", rnd);
+		snprintf(tmpname, sizeof(tmpname), "/tmp/_sock%ld_%d", rnd, getpid());
 		char* tmppath = arcan_find_resource(tmpname, ns, ARES_FILE, NULL);
 		if (!tmppath){
 			local_path = arcan_expand_resource(tmpname, ns);
@@ -174,6 +175,10 @@ int alt_nbio_process_write(lua_State* L, struct nonblock_io* ib)
 			arcan_mem_free(job->buf);
 			arcan_mem_free(job);
 			job = ib->out_queue;
+
+/* edge case, all jobs have been finished and the tail is dropped */
+			if (!job)
+				ib->out_queue_tail = &ib->out_queue;
 		}
 	}
 
@@ -202,6 +207,7 @@ static struct io_job* queue_out(struct nonblock_io* ib, const char* buf, size_t 
 	if (!res)
 		return NULL;
 
+/* prepare new write job */
 	*res = (struct io_job){0};
 	res->buf = malloc(len);
 	if (!res->buf){
@@ -209,13 +215,17 @@ static struct io_job* queue_out(struct nonblock_io* ib, const char* buf, size_t 
 		return NULL;
 	}
 
+/* copy out so lua can drop the buffer */
 	memcpy(res->buf, buf, len);
 	res->sz = len;
 	ib->out_queued += len;
 
+/* remember tail so next queue is faster */
 	if (!ib->out_queue_tail){
 		ib->out_queue_tail = &ib->out_queue;
 	}
+
+/* append and step tail */
 	*(ib->out_queue_tail) = res;
 	ib->out_queue_tail = &(res->next);
 
@@ -574,7 +584,15 @@ static char* nextline(struct nonblock_io* ib,
 
 	if (eof || (!start && ib->ofs == COUNT_OF(ib->buf))){
 		*gotline = false;
-		*nb = ib->ofs;
+		if (ib->ofs < start){
+			*nb = 0;
+			*step = 0;
+			ib->ofs = 0;
+		}
+		else {
+			*nb = ib->ofs - start;
+			*step = ib->ofs - start;
+		}
 		return ib->buf;
 	}
 
@@ -608,13 +626,24 @@ int alt_nbio_process_read(
 	if (0 == nr){
 		eof = true;
 	}
+
+/*
+ * For the old :read() -> line, ok form there is a case where we try to read,
+ * manages to get a line, call a read again and it fails with valid data still
+ * in buffer. In that case we fall through (ib->ofs set) and the normal nonbuf
+ * or nextline approach will continue correctly.
+ */
 	else if (-1 == nr){
 		if (errno == EAGAIN || errno == EINTR){
-			lua_pushnil(L);
-			lua_pushboolean(L, true);
-			return 2;
+			if (!ib->ofs){
+				lua_pushnil(L);
+				lua_pushboolean(L, true);
+				if (!ib->ofs)
+					return 2;
+			}
 		}
-		eof = true;
+		else
+			eof = true;
 	}
 	else
 		ib->ofs += nr;
@@ -624,7 +653,7 @@ int alt_nbio_process_read(
 			lua_pushlstring(L, ib->buf, ib->ofs);
 		else
 			lua_pushnil(L);
-		lua_pushboolean(L, !eof);
+		lua_pushboolean(L, !eof || ib->ofs);
 		ib->ofs = 0;
 		return 2;
 	}
@@ -744,7 +773,7 @@ static int opennonblock_tgt(lua_State* L, bool wr)
 	arcan_frameserver* fsrv = vobj->feed.state.ptr;
 
 	if (vobj->feed.state.tag != ARCAN_TAG_FRAMESERV)
-		arcan_fatal("open_nonblock(tgt), target must be a valid frameserver.\n");
+		arcan_fatal("open_nonblock(tgt), target must be a valid frameserver.");
 
 	int outp[2];
 	if (-1 == pipe(outp)){
@@ -919,7 +948,7 @@ int alt_nbio_open(lua_State* L)
 		}
 		fchmod(fd, S_IRWXU);
 
-		set_nonblock_cloexec(fd, true);
+		alt_nbio_nonblock_cloexec(fd, true);
 		int rv = bind(fd, (struct sockaddr*) &addr, sizeof(addr));
 		if (-1 == rv){
 			close(fd);
@@ -955,7 +984,7 @@ retryopen:
 
 /* socket, 'connect mode' */
 			if (-1 == fd && errno == ENXIO){
-				fd = connect_stream_to(path, namespace, &unlink_fn);
+				fd = alt_nbio_socket(path, namespace, &unlink_fn);
 				wrmode = O_RDWR;
 			}
 		}
@@ -1041,6 +1070,9 @@ void alt_nbio_data_in(lua_State* L, intptr_t tag)
 
 	struct nonblock_io** ibb = luaL_checkudata(L, -1, "nonblockIO");
 	struct nonblock_io* ib = *ibb;
+	if (!ib)
+		return;
+
 	lua_pop(L, 1);
 	lua_rawgeti(L, LUA_REGISTRYINDEX, ib->data_handler);
 	intptr_t ch = ib->data_handler;
@@ -1172,7 +1204,8 @@ static int nbio_flush(lua_State* L)
 }
 
 bool alt_nbio_import(
-	lua_State* L, int fd, mode_t mode, struct nonblock_io** out)
+	lua_State* L, int fd, mode_t mode, struct nonblock_io** out,
+	char** unlink_fn)
 {
 	if (-1 == fd){
 		lua_pushnil(L);
@@ -1201,13 +1234,14 @@ bool alt_nbio_import(
 
 	*nbio = (struct nonblock_io){
 		.fd = fd,
-		.mode = mode
+		.mode = mode,
+		.unlink_fn = (unlink_fn ? *unlink_fn : NULL)
 	};
 
 	if (out)
 		*out = nbio;
 
-	set_nonblock_cloexec(fd, false);
+	alt_nbio_nonblock_cloexec(fd, false);
 
 	luaL_getmetatable(L, "nonblockIO");
 	lua_setmetatable(L, -2);

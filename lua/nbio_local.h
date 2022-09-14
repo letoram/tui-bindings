@@ -52,6 +52,7 @@ static void alt_call(lua_State* L,
 
 #define arcan_fatal(...) do {\
 	fprintf(stderr, __VA_ARGS__);\
+	fprintf(stderr, "\n");\
 	exit(EXIT_FAILURE);\
 }while (0);
 
@@ -75,5 +76,21 @@ static char* arcan_find_resource(const char* prefix, int ns, int kind, int* dfd)
 	if (!res)
 		return NULL;
 
-	return res;
+	int fd = open(res, O_RDONLY);
+
+	if (-1 == fd){
+		if (dfd)
+			*dfd = -1;
+		return NULL;
+	}
+
+	char* expanded = realpath(res, NULL);
+	free(res);
+
+	if (dfd)
+		*dfd = fd;
+	else
+		close(fd);
+
+	return expanded;
 }
