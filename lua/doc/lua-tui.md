@@ -135,7 +135,7 @@ The default attribute can be set and retreived via:
 
 The attrtbl argument can be constructed via the global function:
 
-    tui:get_attribute(tui_attr(optional:context, optional:table) => attrtbl
+    tui:attr(optional:context, optional:table) => attrtbl
 
 If provided, the context argument _must_ point to a context retrieved from
 tui\_open and will take its properties from the defaults in that context.
@@ -143,6 +143,7 @@ The accepted fields in \_table\_ are as follows:
 
     bold : bool
     underline : bool
+    underline_alt : bool
     inverse : bool
     protect : bool
     strikethrough : bool
@@ -156,6 +157,10 @@ The accepted fields in \_table\_ are as follows:
     fg_id : integer
     bg_id : integer
     shape_break : integer
+    border_left : bool
+    border_right : bool
+    border_up : bool
+    border_down : bool
 
 All of these, except for id and shape\_break, directly control the text drawing
 routine. Id is a custom number tag that can be used to associate with
@@ -305,8 +310,12 @@ below, and it cannot reparent. There are three different flavours of embedded
 depending on how the external window manager should treat source resizing. With
 'embed' it will simply crop if the source is too large, with 'scale' it will
 scale to fit with aspect, and with 'synch' the client will be instructed to
-resize, and any resize updates will be forwarded as notifications to the proxy
-window structure.
+resize.
+
+The actual embedded dimensions will be forwarded as resizes to the handler for
+the embedded window. The window manager is free to detach any embeddings and
+can do so with notice or without notice. If this happens the proxy window will
+resize to a zero-width and its view state switch to invisible.
 
 A tabbed window can neither restack nor anchor.
 
@@ -936,10 +945,30 @@ the returned blobio will instead be used to notify when the contents of src has
 been written to dst. When there is data to be read from blobio, the copy has
 finished or otherwise terminated.
 
+bgcopy also takes an optional [flag] string. If it contains "r" the read end
+will be kept open after completion. If it contains "w" the write end will be
+kept open after completion. If it contains "p" the resulting blobio will be fed
+progress state on the copy operation. These are colon-separated numbers of
+buffer-size:bytes-since-last:total-bytes. These progress values are updated
+after a certain number of bytes accumulated or time elapsed.
+
 The read values from blobio behaves a little bit odd in order to not deviate
 from how it works on the C level or to define a separate userdata type. A
 negative value is written once (then the underlying signalling pipe is
 terminated) on failure.
+
+The blobio may be seekable, either relatively through :seek(nbytes) => bool, position
+on the current position - or absolutely through :set\_position(pos) with pos
+being bytes from beginning (>= 0) or end (< 0).
+
+Simplified forms of unlink and remove are also available based on the working
+directory of the window referenced:
+
+   local ok, msg = wnd:funlink("myfile")
+	 if not ok then
+	     print(msg)
+   end
+	 ok, msg = wnd:frename("myfile.old", "myfile.new")
 
 ## Popen
 

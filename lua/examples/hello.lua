@@ -1,23 +1,32 @@
 tui = require 'arcantui'
 
-wnd = tui.open("hi", "", {handlers = {}})
+local function
+redraw(wnd)
+	local hattr = tui.attr({underline_alt = true})
 
-local env = wnd:getenv()
-local _, stdout, _, pid = wnd:popen("find /tmp", "r", wnd:getenv())
+	local l = tui.attr({border_left = true, fg = 255})
+	local r = tui.attr({border_right = true, fg = 255})
+	local tl = tui.attr({border_left = true, border_top = true, fg = 255})
+	local tr = tui.attr({border_right = true, border_top = true, fg = 255})
+	local t = tui.attr({border_top = true, fg = 255})
+	local d = tui.attr({border_down = true, fg = 255})
+	local dl = tui.attr({border_left = true, border_down = true, fg = 255})
+	local dr = tui.attr({border_right = true, border_down = true, fg = 255})
 
-if not pid then
-	print("popen fail")
+	wnd:write_to(0, 0, " ", tl)
+	wnd:write_to(1, 0, "           ", t)
+	wnd:write(" ", tr)
+	wnd:write_to(0, 1, " ", l)
+	wnd:write_to(1, 1, "hello world", hattr)
+	wnd:write(" ", r)
+	wnd:write_to(0, 2, " ", dl)
+	wnd:write_to(1, 2, "           ", d)
+	wnd:write(" ", dr)
 end
 
-local _, alive =
-stdout:data_handler(
-function(_)
-	local nr, ok = stdout:read()
-	print(nr)
-	return ok
-end)
+wnd = tui.open("hi", "", {handlers = {resized = redraw}})
+redraw(wnd)
 
-stdout:lf_strip(true)
 while (wnd:process()) do
 	wnd:refresh()
 end

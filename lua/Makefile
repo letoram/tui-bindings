@@ -4,6 +4,6 @@ ROCKSPEC= $(shell find . -name $(LIBNAME)-*-*.rockspec)
 all: install
 
 install:
-	luarocks-5.1 make --local $(ROCKSPEC)
+	luarocks make --local $(ROCKSPEC)
 
 .PHONY: all install

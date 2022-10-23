@@ -19,7 +19,6 @@
 #include <arcan_tui_readline.h>
 
 #include <assert.h>
-#include <stdio.h>
 #include <stdbool.h>
 #include <fcntl.h>
 #include <lua.h>
@@ -58,11 +57,15 @@ static struct tui_cbcfg shared_cbcfg = {};
  * convenience macro prolog for all TUI callbacks
  */
 #define SETUP_HREF(X, B) \
+	if (!t) return B;\
 	struct tui_lmeta* meta = t;\
 	lua_State* L = meta->lua;\
 	if (meta->href == LUA_NOREF)\
 		return B;\
 	lua_rawgeti(L, LUA_REGISTRYINDEX, meta->href);\
+	if (lua_type(L, -1) != LUA_TTABLE){\
+		luaL_error(L, "broken href in handler for " # B);\
+	}\
 	lua_getfield(L, -1, X);\
 	if (lua_type(L, -1) != LUA_TFUNCTION){\
 		lua_pop(L, 2);\
@@ -300,9 +303,11 @@ static struct tui_constraints get_wndhint(struct tui_lmeta* ib, lua_State* L, in
 
 	if (ib->embed){
 		if (intblbool(L, ind, "scale"))
-			ib->embed = 1;
-		else
 			ib->embed = 2;
+		else if (intblbool(L, ind, "scale-hint"))
+			ib->embed = 3;
+		else
+			ib->embed = 1;
 	}
 
 	res.embed = ib->embed;
@@ -445,13 +450,14 @@ static void on_utf8_paste(struct tui_context* T,
 static void on_resized(struct tui_context* T,
 	size_t neww, size_t newh, size_t col, size_t row, void* t)
 {
+	SETUP_HREF("resized",);
 /* ugly little edge condition - the first on_resized will actually be called in
  * tui-setup already where we don't have the rest of the context or things
  * otherwise prepared. This will cause our TUI_UDATA etc. to fail as the tui
  * member has not yet been set. */
-	SETUP_HREF("resized",);
 		if (!meta->tui)
 			meta->tui = T;
+
 		lua_pushnumber(L, col);
 		lua_pushnumber(L, row);
 		lua_pushnumber(L, neww);
@@ -463,7 +469,19 @@ static void on_resized(struct tui_context* T,
 static void on_resize(struct tui_context* T,
 	size_t neww, size_t newh, size_t col, size_t row, void* t)
 {
-	SETUP_HREF("resize",);
+	struct tui_lmeta* meta = t;
+	lua_State* L = meta->lua;
+	if (meta->href == LUA_NOREF)
+		return;
+	lua_rawgeti(L, LUA_REGISTRYINDEX, meta->href);
+	lua_getfield(L, -1, "resize");
+	if (lua_type(L, -1) != LUA_TFUNCTION){
+		lua_pop(L, 2);
+		return;
+	}\
+	lua_rawgeti(L, LUA_REGISTRYINDEX, meta->tui_state);
+
+/*	SETUP_HREF("resize",); */
 /* same as with on_resized above */
 		if (!meta->tui)
 			meta->tui = T;
@@ -590,13 +608,14 @@ static bool on_subwindow(struct tui_context* T,
 		return false;
 
 	intptr_t cb = meta->pending[id].id;
-	meta->pending[id].id = 0;
+	meta->pending[id].id = LUA_NOREF;
 	meta->pending_mask &= ~(1 << id);
 
 /* indicates that something is wrong with the new_window handler */
 	lua_rawgeti(L, LUA_REGISTRYINDEX, cb);
 	if (lua_type(L, -1) != LUA_TFUNCTION)
 		luaL_error(L, "on_subwindow() bad/broken cb-id");
+	luaL_unref(L, LUA_REGISTRYINDEX, cb);
 
 	lua_rawgeti(L, LUA_REGISTRYINDEX, meta->tui_state);
 
@@ -608,39 +627,53 @@ static bool on_subwindow(struct tui_context* T,
  * trigger unless for handover-allocation like scenarios. */
 	if (!new){
 		RUN_CALLBACK("subwindow_fail", 1, 0);
-		luaL_unref(L, LUA_REGISTRYINDEX, cb);
 		END_HREF;
 		return false;
 	}
 
-/* let the caller be responsible for updating the handlers */
-	struct tui_context* ctx =
-		arcan_tui_setup(new, T, &shared_cbcfg, sizeof(shared_cbcfg));
-	if (!ctx){
-		RUN_CALLBACK("subwindow_setup_fail", 1, 0);
-		luaL_unref(L, LUA_REGISTRYINDEX, cb);
-		END_HREF;
-		return true;
-	}
+/* setup as the basic shared handlers, but the tag is wrong */
+	static struct tui_cbcfg cbcfg;
+	memcpy(&cbcfg, &shared_cbcfg, sizeof(cbcfg));
 
 /* build our new window */
 	struct tui_lmeta* nud = lua_newuserdata(L, sizeof(struct tui_lmeta));
+	cbcfg.tag = nud;
 	if (!nud){
 		RUN_CALLBACK("subwindow_ud_fail", 1, 0);
-		luaL_unref(L, LUA_REGISTRYINDEX, cb);
 		END_HREF;
-		return true;
+		return false;
 	}
 	init_lmeta(L, nud, meta);
+
+/* let the caller be responsible for updating the handlers */
+	struct tui_context* ctx =
+		arcan_tui_setup(new, T, &cbcfg, sizeof(cbcfg));
+	if (!ctx){
+		RUN_CALLBACK("subwindow_setup_fail", 1, 0);
+		END_HREF;
+		return false;
+	}
+
 	nud->tui = ctx;
 	nud->embed = meta->pending[id].embed;
+	arcan_tui_update_handlers(ctx, &cbcfg, NULL, sizeof(cbcfg));
 
-	if (type != TUI_WND_HANDOVER){
+/* if the subwindow is a handover, mark it as such before triggering the
+ * callback so that the :phandover call is permitted */
+	if (type == TUI_WND_HANDOVER)
+		meta->in_subwnd = new;
+
+/* handover windows normally do not need to be tracked or part of the parent
+ * process loop, except for when they are embedded */
+	if (type != TUI_WND_HANDOVER || nud->embed){
 /* cycle- reference ourselves */
 		lua_pushvalue(L, -1);
 		nud->tui_state = luaL_ref(L, LUA_REGISTRYINDEX);
 
-/* register with parent so :process() hits the right hierarchy */
+/* register with parent so :process() hits the right hierarchy, the check for
+ * pending-id + the check on request means that there there is a fitting slot
+ * in parent[subs] - and even if there wouldn't be, it would just block the
+ * implicit :process, explicit would still work. */
 		size_t wnd_i = 0;
 		for (; wnd_i < SEGMENT_LIMIT; wnd_i++){
 			if (!meta->subs[wnd_i]){
@@ -650,12 +683,6 @@ static bool on_subwindow(struct tui_context* T,
 				break;
 			}
 		}
-	}
-/* the check for pending-id + the check on request means that there there is a
- * fitting slot in parent[subs] - and even if there wouldn't be, it would just
- * block the implicit :process, explicit would still work. */
-	else {
-		meta->in_subwnd = new;
 	}
 	RUN_CALLBACK("subwindow_ok", 2, 0);
 
@@ -669,7 +696,6 @@ static bool on_subwindow(struct tui_context* T,
 	}
 	meta->in_subwnd = NULL;
 
-	luaL_unref(L, LUA_REGISTRYINDEX, cb);
 	END_HREF;
 	return ok;
 }
@@ -921,8 +947,10 @@ static void add_attr_tbl(lua_State* L, struct tui_screen_attr attr)
 	SET_BIV("blink", attr.aflags & TUI_ATTR_BLINK);
 	SET_BIV("strikethrough", attr.aflags & TUI_ATTR_STRIKETHROUGH);
 	SET_BIV("break", attr.aflags & TUI_ATTR_SHAPE_BREAK);
+	SET_BIV("border_left", attr.aflags & TUI_ATTR_BORDER_LEFT);
 	SET_BIV("border_right", attr.aflags & TUI_ATTR_BORDER_RIGHT);
 	SET_BIV("border_down", attr.aflags & TUI_ATTR_BORDER_DOWN);
+	SET_BIV("border_top", attr.aflags & TUI_ATTR_BORDER_TOP);
 	SET_KIV("id", attr.custom_id);
 
 #undef SET_KIV
@@ -1031,6 +1059,10 @@ static void apply_table(lua_State* L, int ind, struct tui_screen_attr* attr)
 	attr->aflags |= TUI_ATTR_BLINK * intblbool(L, ind, "blink");
 	attr->aflags |= TUI_ATTR_STRIKETHROUGH * intblbool(L, ind, "strikethrough");
 	attr->aflags |= TUI_ATTR_SHAPE_BREAK * intblbool(L, ind, "break");
+	attr->aflags |= TUI_ATTR_BORDER_LEFT * intblbool(L, ind, "border_left");
+	attr->aflags |= TUI_ATTR_BORDER_RIGHT * intblbool(L, ind, "border_right");
+	attr->aflags |= TUI_ATTR_BORDER_TOP * intblbool(L, ind, "border_top");
+	attr->aflags |= TUI_ATTR_BORDER_DOWN * intblbool(L, ind, "border_down");
 
 	bool ok;
 	attr->custom_id = intblint(L, ind, "id", &ok);
@@ -1335,7 +1367,6 @@ ltui_inherit(lua_State* L, arcan_tui_conn* conn)
 		}
 	}
 
-/* display cleanup is now in the hand of _setup */
 	meta->tui = arcan_tui_setup(conn, NULL, &shared_cbcfg, sizeof(shared_cbcfg));
 	if (!meta->tui){
 		lua_pop(L, 1);
@@ -1438,12 +1469,16 @@ static int collect(lua_State* L)
 static int settbl(lua_State* L)
 {
 	TUI_UDATA;
+
+/* remove the existing table */
 	if (ib->href != LUA_NOREF){
 		luaL_unref(L, LUA_REGISTRYINDEX, ib->href);
 		ib->href = LUA_NOREF;
 	}
 
+/* ensure that we get the handler table, and balance the stack */
 	luaL_checktype(L, 2, LUA_TTABLE);
+	lua_pushvalue(L, 2);
 	ib->href = luaL_ref(L, LUA_REGISTRYINDEX);
 
 	return 0;
@@ -2540,6 +2575,7 @@ static int readline_suggest(lua_State* L)
 
 	ssize_t nelem = lua_rawlen(L, index);
 	bool hint_ext = false;
+
 	lua_getfield(L, index, "hint");
 	if (lua_type(L, -1) == LUA_TTABLE){
 		hint_ext = true;
@@ -2572,13 +2608,10 @@ static int readline_suggest(lua_State* L)
 				lua_rawgeti(L, -1, i+1);
 				if (lua_type(L, -1) == LUA_TSTRING){
 					const char* a2 = lua_tostring(L, -1);
-					size_t l1 = strlen(a1);
-					size_t l2 = strlen(a2);
-					if ((new_suggest[i] = malloc(l1+l2+2))){
-						memcpy(&new_suggest[i][0], a1, l1);
-						memcpy(&new_suggest[i][l1+1], a2, l2);
-						new_suggest[i][l1] = '\0';
-						new_suggest[i][l1+1+l2] = '\0';
+					size_t len = strlen(a1) + strlen(a2) + 2;
+					new_suggest[i] = malloc(strlen(a1) + strlen(a2) + 2);
+					if (new_suggest[i]){
+						snprintf(new_suggest[i], len, "%s%c%s", a1, (char) 0, a2);
 					}
 				}
 				else
@@ -2962,8 +2995,11 @@ static int tui_fstatus(lua_State* L)
 	const char* src = luaL_checkstring(L, 2);
 	struct stat s;
 
+/* this will trigger slightly different behaviour on platforms that still
+ * doesn't support this flag, but the possible workaround is not worth the
+ * edge case handling here */
 #ifndef AT_EMPTY_PATH
-#define AT_EMPTY_PATH 0x1000
+#define AT_EMPTY_PATH 0
 #endif
 
 	if (-1 == fstatat(
