@@ -114,8 +114,8 @@ screen is a grid of cells that carry a character and optional formatting
 attributes. The screen has a cursor, which is the current position output will
 be written to unless the draw call used explicitly manipulates the cursor.
 
-    write(msg) : bool
-    write_to(x, y, msg) : bool, cx, cy
+    write(msg, [attrtbl]) : bool
+    write_to(x, y, msg, [attrtbl]) : bool, cx, cy
     erase()
     erase_region(x1,y1,x2,y2)
 
@@ -133,7 +133,7 @@ The default attribute can be set and retreived via:
 
     wnd:set_default(attrtbl) => attrtbl
 
-The attrtbl argument can be constructed via the global function:
+The ATTrtbl argument can be constructed via the global function:
 
     tui:attr(optional:context, optional:table) => attrtbl
 
@@ -222,7 +222,7 @@ After 'ui', the legacy ansi color palette starts.
 
 The following functions are used to explicitly control the cursor position:
 
-    cursor_to(x, y)
+    cursor_to(x, y, [style:block|bar|underline|frame, [r, g, b, [blink]]])
     cursor_tab(dt)
     cursor_step_col(dx)
     cursor_step_row(dy)
@@ -282,9 +282,9 @@ Then you can use the following function to request a new window to be created:
 
     new_window(type, closure, [hintstr]) => bool
 
-Where type is one of (default) "tui", "popup", "handover" and "virtual". It
-returns true or false depending on the number of permitted subwindows and
-pending requests.
+Where type is one of (default) "tui", "popup", "dock", "handover" and
+"virtual". It returns true or false depending on the number of permitted
+subwindows and pending requests.
 
 The closure function will be called when the window has been created or if the
 request failed. This happens asynchronously as part of :process and can take

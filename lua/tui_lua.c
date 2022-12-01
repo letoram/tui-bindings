@@ -1134,6 +1134,23 @@ static int defattr(lua_State* L)
 	return 1;
 }
 
+static int getxy(lua_State* L)
+{
+	TUI_UDATA;
+	size_t x = luaL_checkinteger(L, 2);
+	size_t y = luaL_checkinteger(L, 3);
+	bool front = luaL_optbnumber(L, 4, true);
+
+	struct tui_cell cell = arcan_tui_getxy(ib->tui, x, y, front);
+
+	char str[4];
+	arcan_tui_ucs4utf8(cell.ch, str);
+	lua_pushlstring(L, str, 4);
+
+	add_attr_tbl(L, cell.attr);
+	return 2;
+}
+
 static int screen_dimensions(lua_State* L)
 {
 	TUI_UDATA;
@@ -1174,11 +1191,45 @@ static int cursor_to(lua_State* L)
 	TUI_UDATA;
 	int x = luaL_checkinteger(L, 2);
 	int y = luaL_checkinteger(L, 3);
+
+	int fl = 0;
+	const char* style = luaL_optstring(L, 4, NULL);
+	if (style){
+		if (strcmp(style, "block") == 0)
+			fl = CURSOR_BLOCK;
+		else if (strcmp(style, "bar") == 0)
+			fl = CURSOR_BAR;
+		else if (strcmp(style, "underline") == 0)
+			fl = CURSOR_UNDER;
+		else if (strcmp(style, "frame") == 0)
+			fl = CURSOR_HOLLOW;
+	}
+
+/* do we have a rgb triplet? */
+	uint8_t* col = NULL;
+	uint8_t colv[] = {0, 0, 0};
+	if (lua_type(L, 5) == LUA_TNUMBER && lua_type(L, 6) ==
+		LUA_TNUMBER && lua_type(L, 7) == LUA_TNUMBER){
+		colv[0] = (uint8_t) lua_tonumber(L, 5);
+		colv[1] = (uint8_t) lua_tonumber(L, 6);
+		colv[2] = (uint8_t) lua_tonumber(L, 7);
+		col = colv;
+
+/* and last arg is treated as blink bval */
+		if (luaL_optnumber(L, 8, 0))
+			fl |= CURSOR_BLINK;
+	}
+	else if (luaL_optnumber(L, 5, 0))
+		fl |= CURSOR_BLINK;
+
 	size_t rows, cols;
 	arcan_tui_dimensions(ib->tui, &rows, &cols);
 
 	if (x >= 0 && y >= 0 && x < cols && y < rows)
 		arcan_tui_move_to(ib->tui, x, y);
+
+	if (col || fl)
+		arcan_tui_cursor_style(ib->tui, fl, col);
 
 	return 0;
 }
@@ -1278,23 +1329,47 @@ static int tui_chdir(lua_State* L)
 	return 1;
 }
 
+static int tui_local(lua_State* L)
+{
+	struct tui_lmeta* ib = NULL;
+	size_t ci = 1;
+
+/* somewhere to derive color configuration from */
+	if (lua_type(L, ci) == LUA_TUSERDATA){
+		struct tui_lmeta* ib = luaL_checkudata(L, ci++, TUI_METATABLE);
+		ci++;
+	}
+
+/* base dimensions */
+	size_t w = 80;
+	size_t h = 25;
+	if (lua_type(L, ci) == LUA_TNUMBER){
+		w = lua_tonumber(L, ci);
+		h = luaL_optnumber(L, ci+1, 25);
+	}
+
+/* build / inherit but with a null connection */
+	struct tui_context* res = ltui_inherit(L, NULL, ib);
+	if (!res)
+		return 0;
+
+	arcan_tui_wndhint(res,
+		ib ? ib->tui : NULL, (struct tui_constraints){.max_rows = h, .max_cols = w});
+
+	return 1;
+}
+
 static int tui_open(lua_State* L)
 {
 	const char* title = luaL_checkstring(L, 1);
 	const char* ident = luaL_checkstring(L, 2);
 
 	arcan_tui_conn* conn = arcan_tui_open_display(title, ident);
-/* will be GCd */
-	if (!conn){
-		lua_pop(L, 1);
-		return 0;
-	}
-
-	return ltui_inherit(L, conn) ? 1 : 0;
+	return ltui_inherit(L, conn, NULL) ? 1 : 0;
 }
 
 struct tui_context*
-ltui_inherit(lua_State* L, arcan_tui_conn* conn)
+ltui_inherit(lua_State* L, arcan_tui_conn* conn, struct tui_lmeta* T)
 {
 	register_tuimeta(L);
 
@@ -1302,7 +1377,7 @@ ltui_inherit(lua_State* L, arcan_tui_conn* conn)
 	if (!meta){
 		return NULL;
 	}
-	init_lmeta(L, meta, NULL);
+	init_lmeta(L, meta, T);
 	lua_pushvalue(L, -1);
 	meta->tui_state = luaL_ref(L, LUA_REGISTRYINDEX);
 
@@ -1356,7 +1431,8 @@ ltui_inherit(lua_State* L, arcan_tui_conn* conn)
 		}
 	}
 
-	meta->tui = arcan_tui_setup(conn, NULL, &shared_cbcfg, sizeof(shared_cbcfg));
+	meta->tui = arcan_tui_setup(conn,
+		T ? T->tui : NULL, &shared_cbcfg, sizeof(shared_cbcfg));
 	if (!meta->tui){
 		lua_pop(L, 1);
 		return NULL;
@@ -1578,6 +1654,9 @@ static int reqwnd(lua_State* L)
 			meta.hint = TUIWND_EMBED;
 			embed_fl = 3;
 		}
+		else if (strcmp(hintstr, "swallow") == 0){
+			meta.hint = TUIWND_SWALLOW;
+		}
 		else
 			luaL_error(L,"new_window(..., >hint<) "
 				"unknown hint (split-(tldr), join-(tldr), tab or embed");
@@ -1586,8 +1665,14 @@ static int reqwnd(lua_State* L)
 	int tui_type = TUI_WND_TUI;
 	if (strcmp(type, "popup") == 0)
 		tui_type = TUI_WND_POPUP;
+	else if (strcmp(type, "dock") == 0)
+		tui_type = TUI_WND_DOCKICON;
 	else if (strcmp(type, "handover") == 0)
 		tui_type = TUI_WND_HANDOVER;
+	else if (strcmp(type, "tui") == 0){}
+	else
+		luaL_error(L,
+			"new_window(>type<, ...) unsupported type (popup, handover, dock)");
 
 	if (ib->pending_mask == 255){
 		lua_pushboolean(L, false);
@@ -1823,11 +1908,32 @@ static int getcursor(lua_State* L)
 	return 2;
 }
 
+static int write_border(lua_State* L)
+{
+	TUI_UDATA;
+	size_t x1 = luaL_checkinteger(L, 2);
+	size_t y1 = luaL_checkinteger(L, 3);
+	size_t x2 = luaL_checkinteger(L, 4);
+	size_t y2 = luaL_checkinteger(L, 5);
+	int fl = luaL_optinteger(L, 7, 0);
+
+	struct tui_screen_attr mattr;
+	arcan_tui_defattr(ib->tui, &mattr);
+
+	if (lua_type(L, 6) == LUA_TTABLE){
+		apply_table(L, 6, &mattr);
+	}
+
+	arcan_tui_write_border(ib->tui, mattr, x1, y1, x2, y2, fl);
+	return 0;
+}
+
 static int write_tou8(lua_State* L)
 {
 	TUI_UDATA;
 	struct tui_screen_attr* attr = NULL;
 	struct tui_screen_attr mattr = {};
+	arcan_tui_defattr(ib->tui, &mattr);
 	size_t len;
 
 	size_t x = luaL_checkinteger(L, 2);
@@ -2147,7 +2253,8 @@ static int readline(lua_State* L)
 		.tab_completion = true,
 		.mouse_forward = false,
 		.paste_forward = false,
-		.block_builtin_bindings = false
+		.block_builtin_bindings = false,
+		.completion_compact = false
 	};
 
 	if (!lua_isfunction(L, ofs) || lua_iscfunction(L, ofs)){
@@ -2190,6 +2297,8 @@ static int readline(lua_State* L)
 			opts.tab_completion = false;
 		if (intblbool(L, tbl, "block_builtin"))
 			opts.block_builtin_bindings = true;
+		if (intblbool(L, tbl, "compact"))
+			opts.completion_compact = true;
 
 		opts.mouse_forward = intblbool(L, tbl, "forward_mouse");
 		opts.paste_forward = intblbool(L, tbl, "forward_paste");
@@ -3310,6 +3419,8 @@ static void register_tuimeta(lua_State* L)
 		{"refresh", refresh},
 		{"write", writeu8},
 		{"write_to", write_tou8},
+		{"write_border", write_border},
+		{"get", getxy},
 		{"set_handlers", settbl},
 		{"update_identity", setident},
 		{"set_default", defattr},
@@ -3414,6 +3525,22 @@ static void register_tuimeta(lua_State* L)
 	{"inactive", TUI_COL_INACTIVE},
 	{"reference", TUI_COL_REFERENCE},
 	{"ui", TUI_COL_UI},
+	{"ref_black", TUI_COL_TBASE+0},
+	{"ref_red", TUI_COL_TBASE+1},
+	{"ref_green", TUI_COL_TBASE+2},
+	{"ref_yellow", TUI_COL_TBASE+3},
+	{"ref_blue", TUI_COL_TBASE+4},
+	{"ref_magenta", TUI_COL_TBASE+5},
+	{"ref_cyan", TUI_COL_TBASE+6},
+	{"ref_grey", TUI_COL_TBASE+8},
+	{"ref_light_grey", TUI_COL_TBASE+7},
+	{"ref_light_red", TUI_COL_TBASE+9},
+	{"ref_light_green", TUI_COL_TBASE+10},
+	{"ref_light_yellow", TUI_COL_TBASE+11},
+	{"ref_light_blue", TUI_COL_TBASE+12},
+	{"ref_light_magenta", TUI_COL_TBASE+13},
+	{"ref_light_cyan", TUI_COL_TBASE+14},
+	{"ref_white", TUI_COL_TBASE+15},
 	};
 	lua_pushliteral(L, "colors");
 	lua_newtable(L);
@@ -3649,6 +3776,7 @@ luaopen_arcantui(lua_State* L)
 		{"APIVersion", apiversion},
 		{"APIVersionString", apiversionstr},
 		{"open", tui_open},
+		{"create_local", tui_local}
 	};
 
 	lua_newtable(L);
