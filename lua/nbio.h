@@ -13,9 +13,12 @@ struct io_job {
 };
 
 struct nonblock_io {
+	uint32_t canary_pre;
+
 	bool eofm;
 	bool lfstrip;
 	off_t ofs;
+	char lfch;
 
 	int fd; /* will be read from */
 
@@ -24,18 +27,18 @@ struct nonblock_io {
 	struct io_job* out_queue;
 	struct io_job** out_queue_tail;
 
-	intptr_t write_handler; /* callback when queue flushed */
-
 	mode_t mode;
 	char* unlink_fn;
 	char* pending;
 
 	bool data_rearmed;
 	intptr_t data_handler; /* callback on_data_in */
-	intptr_t ref; /* :self reference to block GC */
+	intptr_t write_handler; /* callback when queue flushed */
 
 /* in line-buffered mode, this is used for input */
 	char buf[4096];
+
+	uint32_t canary_post;
 };
 
 /*
@@ -51,7 +54,8 @@ struct nonblock_io {
  */
 void alt_nbio_register(lua_State* ctx,
 	bool (*add)(int fd, mode_t, intptr_t tag),
-	bool (*remove)(int fd, mode_t, intptr_t* out)
+	bool (*remove)(int fd, mode_t, intptr_t* out),
+	void (*error)(lua_State* L, int fd, intptr_t tag, const char*)
 );
 
 /*

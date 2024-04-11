@@ -37,14 +37,42 @@
 	#define lua_rawlen(x, y) lua_objlen(x, y)
 #endif
 
-static struct nonblock_io open_fds[LUACTX_OPEN_FILES];
+#ifdef WANT_ARCAN_BASE
+#define arcan_fatal(...) do { alt_fatal( __VA_ARGS__); } while(0)
+#endif
 
+static struct nonblock_io open_fds[LUACTX_OPEN_FILES];
 /* open_nonblock and similar functions need to register their fds here as they
  * are force-closed on context shutdown, this is necessary with crash recovery
  * and scripting errors. The limit is set based on the same open limit imposed
  * by arcan_event_ sources. */
 static bool (*add_job)(int fd, mode_t mode, intptr_t tag);
 static bool (*remove_job)(int fd, mode_t mode, intptr_t* out);
+static void (*trigger_error)(lua_State* L, int fd, intptr_t tag, const char*);
+
+static bool lookup_registry(lua_State* L, intptr_t tag, int type, const char* src)
+{
+	lua_rawgeti(L, LUA_REGISTRYINDEX, tag);
+	if (lua_type(L, -1) != type){
+		trigger_error(L, -1, tag, src);
+
+		lua_pop(L, 1);
+		return false;
+	}
+	return true;
+}
+
+static void unref_registry(lua_State* L, intptr_t tag, int type, const char* src)
+{
+#ifdef _DEBUG
+	if (lookup_registry(L, tag, type, src)){
+		lua_pop(L, 1);
+	}
+	else
+		return;
+#endif
+	luaL_unref(L, LUA_REGISTRYINDEX, tag);
+}
 
 void alt_nbio_nonblock_cloexec(int fd, bool socket)
 {
@@ -61,6 +89,57 @@ void alt_nbio_nonblock_cloexec(int fd, bool socket)
 
 	if (-1 != (flags = fcntl(fd, F_GETFD)))
 		fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+}
+
+/* this symbol comes parasitically with arcan-shmif and used inside the tui
+ * implementation, thus it is not particularly nice to rely on it - on the
+ * other hand vendoring in the code is also annoying */
+extern unsigned long long arcan_timemillis();
+
+static bool ensure_flush(lua_State* L, struct nonblock_io* ib, size_t timeout)
+{
+	bool rv = true;
+	struct pollfd fd = {
+		.fd = ib->fd,
+		.events = POLLOUT | POLLERR | POLLHUP | POLLNVAL
+	};
+
+/* since poll doesn't give much in terms of feedback across calls some crude
+ * timekeeping is needed to make sure we don't exceed a timeout by too much */
+	unsigned long long current = arcan_timemillis();
+	int status;
+
+/* writes can fail.. */
+	while ((status = alt_nbio_process_write(L, ib)) == 0){
+
+		if (timeout > 0){
+			unsigned long long now = arcan_timemillis();
+			if (now > current)
+				timeout -= now - current;
+			current = now;
+
+			if (timeout <= 0){
+				rv = false;
+				break;
+			}
+		}
+
+/* dst can die while waiting for write-state */
+		int rv = poll(&fd, 1, timeout);
+
+		if (-1 == rv && (errno == EAGAIN || errno == EINTR))
+				continue;
+
+		if (fd.revents & (POLLERR | POLLHUP | POLLNVAL)){
+			rv = false;
+			break;
+		}
+	}
+
+	if (status < 0)
+		rv = false;
+
+	return rv;
 }
 
 static int connect_trypath(const char* local, const char* remote, int type)
@@ -249,19 +328,23 @@ int alt_nbio_close(lua_State* L, struct nonblock_io** ibb)
 	free(ib->pending);
 	drop_all_jobs(ib);
 
-	if (ib->data_handler)
-		luaL_unref(L, LUA_REGISTRYINDEX, ib->data_handler);
+	if (ib->data_handler != LUA_NOREF){
+		unref_registry(L, ib->data_handler, LUA_TFUNCTION, "nbio_close_dh");
+		ib->data_handler = LUA_NOREF;
+	}
 
-	if (ib->write_handler)
-		luaL_unref(L, LUA_REGISTRYINDEX, ib->write_handler);
+	if (ib->write_handler != LUA_NOREF){
+		unref_registry(L, ib->write_handler, LUA_TFUNCTION, "nbio_close_wh");
+		ib->write_handler = LUA_NOREF;
+	}
 
 /* no-op if nothing registered */
 	intptr_t tag;
 	if (remove_job(fd, O_RDONLY, &tag)){
-		luaL_unref(L, LUA_REGISTRYINDEX, tag);
+		unref_registry(L, tag, LUA_TUSERDATA, "nbio_close_rdmeta");
 	}
 	if (remove_job(fd, O_WRONLY, &tag)){
-		luaL_unref(L, LUA_REGISTRYINDEX, tag);
+		unref_registry(L, tag, LUA_TUSERDATA, "nbio_close_wrmeta");
 	}
 
 	free(ib);
@@ -271,7 +354,10 @@ int alt_nbio_close(lua_State* L, struct nonblock_io** ibb)
  * event handlers and triggers will be removed through drop_all_jobs */
 	for (size_t i = 0; i < LUACTX_OPEN_FILES; i++){
 		if (open_fds[i].fd == fd){
-			open_fds[i] = (struct nonblock_io){0};
+			open_fds[i] = (struct nonblock_io){
+				.data_handler = LUA_NOREF,
+				.write_handler = LUA_NOREF
+			};
 			break;
 		}
 	}
@@ -289,6 +375,10 @@ static int nbio_closer(lua_State* L)
 	if (!(*ib))
 		LUA_ETRACE("open_nonblock:close", "already closed", 0);
 
+/* arbitrary timeout though we should not really hit this and the alternatives
+ * are all practically worse - the only other 'saving' grace' would be to fire
+ * the job in its own thread or fork() and let it timeout or die .. */
+	ensure_flush(L, *ib, 1000);
 	alt_nbio_close(L, ib);
 
 	LUA_ETRACE("open_nonblock:close", NULL, 0);
@@ -302,9 +392,9 @@ static int nbio_datahandler(lua_State* L)
 		LUA_ETRACE("open_nonblock:data_handler", "already closed", 0);
 
 /* always remove the last known handler refs */
-	if ((*ib)->data_handler){
-		luaL_unref(L, LUA_REGISTRYINDEX, (*ib)->data_handler);
-		(*ib)->data_handler = 0;
+	if ((*ib)->data_handler != LUA_NOREF){
+		unref_registry(L, (*ib)->data_handler, LUA_TFUNCTION, "nbio-dh-reset");
+		(*ib)->data_handler = LUA_NOREF;
 	}
 
 /* tracking to ensure that we detect nbio_data_in -> cb ->data_handler */
@@ -313,7 +403,7 @@ static int nbio_datahandler(lua_State* L)
 /* the same goes for the reference used to tag events */
 	intptr_t out;
 	if (remove_job((*ib)->fd, O_RDONLY, &out)){
-		luaL_unref(L, LUA_REGISTRYINDEX, out);
+		unref_registry(L, out, LUA_TUSERDATA, "nbio-rdonly-meta-reset");
 	}
 
 /* update the handler field in ib, then we get the reference to ib and
@@ -333,7 +423,7 @@ static int nbio_datahandler(lua_State* L)
 /* the job can fail to queue if a set amount of read_handler descriptors
  * are exceeded */
 		if (!add_job((*ib)->fd, O_RDONLY, ref)){
-			luaL_unref(L, LUA_REGISTRYINDEX, ref);
+			unref_registry(L, ref, LUA_TUSERDATA, "nbio-rdonly-meta-fail");
 			lua_pushboolean(L, false);
 		}
 
@@ -390,6 +480,9 @@ static int nbio_socketaccept(lua_State* L)
 	(*conn) = (struct nonblock_io){
 		.fd = newfd,
 		.mode = O_RDWR,
+		.data_handler = LUA_NOREF,
+		.write_handler = LUA_NOREF,
+		.lfch = '\n'
 	};
 
 	if (!conn){
@@ -505,9 +598,9 @@ static int nbio_write(lua_State* L)
 
 /* might be swapping out one handler for another */
 	if (lua_type(L, 3) == LUA_TFUNCTION){
-		if (iw->write_handler){
-			luaL_unref(L, LUA_REGISTRYINDEX, iw->write_handler);
-			iw->write_handler = 0;
+		if (iw->write_handler != LUA_NOREF){
+			unref_registry(L, iw->write_handler, LUA_TFUNCTION, "nbio-write-cb-chg");
+			iw->write_handler = LUA_NOREF;
 		}
 
 		lua_pushvalue(L, 3);
@@ -546,7 +639,7 @@ static int nbio_write(lua_State* L)
  * first time so only unreference if it was actually removed */
 	intptr_t ref;
 	if (remove_job(iw->fd, O_WRONLY, &ref)){
-		luaL_unref(L, LUA_REGISTRYINDEX, ref);
+		unref_registry(L, ref, LUA_TUSERDATA, "nbio-wrmeta-chg");
 	}
 
 /* register the ref and the write mode to some outer dispatch */
@@ -565,7 +658,8 @@ static int nbio_write(lua_State* L)
 }
 
 static char* nextline(struct nonblock_io* ib,
-	size_t start, bool eof, size_t* nb, size_t* step, bool* gotline)
+	size_t start, bool eof, size_t* nb, size_t* step,
+	bool* gotline, char linech)
 {
 	if (!ib->ofs)
 		return NULL;
@@ -573,7 +667,7 @@ static char* nextline(struct nonblock_io* ib,
 	*step = 0;
 
 	for (size_t i = start; i < ib->ofs; i++){
-		if (ib->buf[i] == '\n'){
+		if (ib->buf[i] == linech){
 			*nb = ib->lfstrip ? (i - start) : (i - start) + 1;
 			*step = (i - start) + 1;
 			*gotline = true;
@@ -679,7 +773,7 @@ int alt_nbio_process_read(
 		bool cancel = false;
 		while (
 			!cancel &&
-			(ch = nextline(ib, ci, eof, &len, &step, &gotline))){
+			(ch = nextline(ib, ci, eof, &len, &step, &gotline, ib->lfch))){
 			lua_pushvalue(L, -1);
 			lua_pushlstring(L, ch, len);
 			lua_pushboolean(L, eof && !gotline);
@@ -709,7 +803,10 @@ int alt_nbio_process_read(
 
 	while (
 			count &&
-			(ch = nextline(ib, ci, eof, &len, &step, &gotline))){
+			(ch = nextline(ib, ci, eof, &len, &step, &gotline, ib->lfch))){
+			if (eof && len == 0 && step == 0)
+				break;
+
 			lua_pushinteger(L, ind++);
 			lua_pushlstring(L, ch, len);
 			lua_rawset(L, -3);
@@ -722,7 +819,7 @@ int alt_nbio_process_read(
 		return 2;
 	}
 	else {
-		if ((ch = nextline(ib, 0, eof, &len, &step, &gotline))){
+		if ((ch = nextline(ib, 0, eof, &len, &step, &gotline, ib->lfch))){
 			lua_pushlstring(L, ch, len);
 			memmove(ib->buf, &ib->buf[step], buf_sz - step);
 			ib->ofs -= step;
@@ -742,6 +839,11 @@ static int nbio_lf(lua_State* L)
 	struct nonblock_io* ir = *ib;
 
 	ir->lfstrip = luaL_optbnumber(L, 2, 0);
+
+	if (lua_type(L, 3) == LUA_TSTRING){
+		const char* ch = lua_tostring(L, 3);
+		ir->lfch = ch[0];
+	}
 
 	LUA_ETRACE("open_nonblock:lf_strip", NULL, 0);
 }
@@ -774,26 +876,42 @@ static int opennonblock_tgt(lua_State* L, bool wr)
 	if (vobj->feed.state.tag != ARCAN_TAG_FRAMESERV)
 		arcan_fatal("open_nonblock(tgt), target must be a valid frameserver.");
 
-	int outp[2];
-	if (-1 == pipe(outp)){
-		arcan_warning("open_nonblock(tgt), pipe-pair creation failed: %d\n", errno);
-		return 0;
-	}
-
+/* overloaded form:
+ *  open_nonblock(vid, r | w, type, nbio_ud)
+ *
+ *  This takes an existing userdata, extracts the descriptor and sends to the
+ *  target, while disassociating the descriptor from the argument source.
+ */
 	const char* type = luaL_optstring(L, 3, "stream");
-
-/* WRITE mode = 'INPUT' in the client space */
-	int dst = wr ? outp[0] : outp[1];
-	int src = wr ? outp[1] : outp[0];
-
-/* in any scenario where this would fail, "blocking" behavior is acceptable */
-	set_nonblock_cloexec(src, true);
 	struct arcan_event ev = {
 		.category = EVENT_TARGET,
 		.tgt.kind = wr ? TARGET_COMMAND_BCHUNK_IN : TARGET_COMMAND_BCHUNK_OUT
 	};
 	snprintf(ev.tgt.message, COUNT_OF(ev.tgt.message), "%s", type);
+	if (lua_type(L, 4) == LUA_TUSERDATA){
+		struct nonblock_io** ibb = luaL_checkudata(L, 4, "nonblockIO");
+		struct nonblock_io* ib = *ibb;
 
+		if (ib->fd > 0){
+			platform_fsrv_pushfd(fsrv, &ev, ib->fd);
+			close(ib->fd);
+			ib->fd = -1;
+		}
+
+		return 0;
+	}
+
+/* WRITE mode = 'INPUT' in the client space */
+	int outp[2];
+	if (-1 == pipe(outp)){
+		arcan_warning("open_nonblock(tgt), pipe-pair creation failed: %d\n", errno);
+		return 0;
+	}
+	int dst = wr ? outp[0] : outp[1];
+	int src = wr ? outp[1] : outp[0];
+
+/* in any scenario where this would fail, "blocking" behavior is acceptable */
+	alt_nbio_nonblock_cloexec(src, true);
 	if (ARCAN_OK != platform_fsrv_pushfd(fsrv, &ev, dst)){
 		close(dst);
 		close(src);
@@ -812,6 +930,8 @@ static int opennonblock_tgt(lua_State* L, bool wr)
 	conn->mode = wr ? O_WRONLY : O_RDONLY;
 	conn->fd = src;
 	conn->pending = NULL;
+	conn->data_handler = LUA_NOREF;
+	conn->write_handler = LUA_NOREF;
 
 	uintptr_t* dp = lua_newuserdata(L, sizeof(uintptr_t));
 	*dp = (uintptr_t) conn;
@@ -835,23 +955,225 @@ void alt_nbio_release()
 			close(ent->fd);
 		}
 		drop_all_jobs(ent);
-		open_fds[i] = (struct nonblock_io){0};
+		open_fds[i] =
+			(struct nonblock_io){
+			.data_handler = LUA_NOREF,
+			.write_handler = LUA_NOREF
+		};
 	}
+}
+
+struct pathfd {
+	char* path;
+	char* unlink;
+	const char* err;
+	const char* metatable;
+	int fd;
+	int wrmode;
+};
+
+static struct pathfd build_fifo_ipc(char* path, bool userns, bool expect_write)
+{
+	struct pathfd res = {
+		.path = NULL,
+		.fd = -1,
+		.err = NULL
+	};
+	int ns = userns ? RESOURCE_NS_USER : RESOURCE_APPL_TEMP;
+
+	char* workpath = arcan_expand_resource(path, ns);
+	if (!workpath){
+		res.err = "Couldn't expand FIFO path";
+		return res;
+	}
+
+/* if it doesn't exist and we are the write end, create and try again */
+	struct stat fi;
+	if (-1 == stat(path, &fi)){
+		if (expect_write){
+			if (-1 == mkfifo(workpath, S_IRWXU)){
+				arcan_mem_free(workpath);
+				res.err = "Couldn't build FIFO";
+				return res;
+			}
+			int fd = open(workpath, O_RDWR);
+			if (-1 == fd){
+				arcan_mem_free(workpath);
+				res.err = "Couldn't bind FIFO";
+				return res;
+			}
+			res.unlink = workpath;
+			res.fd = fd;
+			return res;
+		}
+		else {
+			res.path = workpath;
+			return res;
+		}
+	}
+
+	int fd = open(workpath, expect_write ? O_WRONLY : O_RDONLY);
+	arcan_mem_free(workpath);
+
+	if (-1 == fd || -1 == fstat(fd, &fi) || S_ISFIFO(fi.st_mode)){
+		close(fd);
+		res.err = "Couldn't open as FIFO";
+		return res;
+	}
+
+	int flags = fcntl(fd, F_GETFL);
+	if (-1 != flags)
+		fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+	if (-1 != (flags = fcntl(fd, F_GETFD)))
+		fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+
+	res.fd = fd;
+	return res;
+}
+
+static struct pathfd build_socket_ipc(char* pathin, bool userns, bool srv)
+{
+	struct pathfd res = {.path = NULL, .fd = -1, .err = NULL};
+	int ns = userns ? RESOURCE_NS_USER : RESOURCE_APPL_TEMP;
+
+	if (srv){
+		char* workpath = arcan_find_resource(pathin, ns, ARES_FILE, NULL);
+
+		if (workpath){
+			res.err = "EINVAL: Couldn't create socket";
+			arcan_mem_free(workpath);
+			return res;
+		}
+
+		workpath = arcan_expand_resource(pathin, ns);
+		if (!workpath){
+			res.err = "EINVAL: Couldn't build socket file";
+			return res;
+		}
+
+		struct sockaddr_un addr = {
+			.sun_family = AF_UNIX
+		};
+		size_t lim = COUNT_OF(addr.sun_path);
+		if (strlen(workpath) > lim - 1){
+			res.err = "ENAMETOOLONG: expanded socket doesn't fit sockaddr";
+			arcan_mem_free(workpath);
+			return res;
+		}
+		snprintf(addr.sun_path, lim, "%s", workpath);
+
+		res.fd = socket(AF_UNIX, SOCK_STREAM, 0);
+		if (-1 == res.fd){
+			res.err = "EPERM: couldn't allocate socket";
+			arcan_mem_free(workpath);
+			return res;
+		}
+		fchmod(res.fd, S_IRWXU);
+
+		if (-1 == bind(res.fd, (struct sockaddr*) &addr, sizeof(addr))){
+			close(res.fd);
+			arcan_mem_free(workpath);
+			res.fd = -1;
+			res.err = "ESOCKET: couldn't bind socket";
+			return res;
+		}
+
+/* this one takes a different metatable to handle accept on connect */
+		listen(res.fd, 5);
+		res.unlink = workpath;
+		res.metatable = "nonblockIOs";
+		res.wrmode = O_RDWR;
+	}
+	else {
+		char* workpath = arcan_find_resource(pathin, ns, ARES_FILE, NULL);
+
+		if (!workpath){
+			res.err = "EEXIST: Couldn't connect to socket";
+			return res;
+		}
+
+		res.fd = alt_nbio_socket(workpath, ns, &res.unlink);
+		res.wrmode = O_RDWR;
+		res.metatable = "nonblockIO";
+
+		if (-1 == res.fd){
+			res.err = "EPERM: Couldn't bind to socket";
+		}
+
+		arcan_mem_free(workpath);
+	}
+
+	return res;
+}
+
+static struct pathfd build_new_file(char* path, bool userns)
+{
+	struct pathfd res = {
+		.path = NULL,
+		.fd = -1,
+		.err = NULL,
+		.metatable = "nonblockIO",
+		.wrmode = O_RDWR
+	};
+	int ns = userns ? RESOURCE_NS_USER : RESOURCE_APPL_TEMP;
+
+	char* userpath = arcan_find_resource(
+		path, ns, ARES_FILE | ARES_CREATE, &res.fd);
+
+#ifdef WANT_ARCAN_BASE
+	if (lua_debug_level){
+		arcan_warning("find_resource:ns=%d:%s\n", ns, path ? path : "[null]");
+	}
+#endif
+
+	if (!path){
+		res.err = "Couldn't create file in namespace";
+	}
+	else
+		arcan_mem_free(userpath);
+
+	return res;
+}
+
+static struct pathfd open_existing_file(char* path, bool userns)
+{
+	struct pathfd res = {
+		.path = NULL,
+		.err = NULL,
+		.fd = -1,
+		.wrmode = O_RDONLY,
+		.metatable = "nonblockIO"
+	};
+
+	int ns = userns ? RESOURCE_NS_USER : DEFAULT_USERMASK;
+	char* cpath = arcan_find_resource(path, ns, ARES_FILE, &res.fd);
+
+#ifdef WANT_ARCAN_BASE
+	if (lua_debug_level){
+		arcan_warning(
+			"find_resource:ns=%d:%s=%s\n", ns, path, cpath ? cpath : "[null]");
+	}
+#endif
+
+	if (!cpath){
+		res.err = "Couldn't find file";
+	}
+
+	arcan_mem_free(cpath);
+	return res;
 }
 
 int alt_nbio_open(lua_State* L)
 {
 	LUA_TRACE("open_nonblock");
-
-	const char* metatable = "nonblockIO";
-	char* unlink_fn = NULL;
+	struct pathfd pfd;
 
 	int wrmode = luaL_optbnumber(L, 2, 0) ? O_WRONLY : O_RDONLY;
-	bool fifo = false, ignerr = false, use_socket = false;
-	char* path;
-	int fd;
+	bool userns = false;
 
-/* nonblock-io write to/from an explicit vid */
+/* nonblock-io write to/from an explicit vid,
+ * this might also be opening a hash to/from an existing a12 monitor */
 #ifdef WANT_ARCAN_BASE
 	if (lua_type(L, 1) == LUA_TNUMBER){
 		int rv = opennonblock_tgt(L, wrmode == O_WRONLY);
@@ -859,160 +1181,48 @@ int alt_nbio_open(lua_State* L)
 	}
 #endif
 
-	int namespace = RESOURCE_APPL_TEMP;
-	const char* str = luaL_checkstring(L, 1);
-	if (str[0] == '<'){
-		fifo = true;
-		str++;
-	}
-	else if (str[0] == '='){
-		use_socket = true;
-		str++;
-	}
-	else {
-		size_t i = 0;
-		for (;str[i] && isalnum(str[i]); i++);
-		if (str[i] == ':' && str[i+1] == '/'){
-			namespace = RESOURCE_NS_USER;
-		}
+	char* str = strdup(luaL_checkstring(L, 1));
+
+	size_t i = 0;
+	for (;str[i] && isalnum(str[i]); i++);
+	if (str[i] == ':' && str[i+1] == '/'){
+		userns = RESOURCE_NS_USER;
 	}
 
-/* note on file-system races: it is an explicit contract that the namespace
- * provided for RESOURCE_APPL_TEMP is single- user (us) only. Anyhow, this
- * code turned out a lot messier than needed, refactor when time permits. */
-	if (wrmode == O_WRONLY){
-		struct stat fi;
-		path = arcan_find_resource(str, namespace, ARES_FILE, NULL);
+	if (str[0] == '<')
+		pfd = build_fifo_ipc(str+1, userns, wrmode == O_WRONLY);
+	else if (str[0] == '=')
+		pfd = build_socket_ipc(str+1, userns, wrmode != O_WRONLY);
+	else if (wrmode == O_WRONLY)
+		pfd = build_new_file(str, userns);
+	else
+		pfd = open_existing_file(str, userns);
 
-/* we require a zap_resource call if the file already exists, except for in
- * the case of a fifo dst- that we can open in (w) mode */
-		bool dst_fifo = (path && -1 != stat(path, &fi) && S_ISFIFO(fi.st_mode));
-		if (!dst_fifo && (path || !(path = arcan_expand_resource(str, namespace)))){
-			arcan_warning("open_nonblock(), refusing to open "
-				"existing file for writing\n");
-			arcan_mem_free(path);
+	free(str);
 
-			LUA_ETRACE("open_nonblock", "write on already existing file", 0);
-		}
-
-		int fl = O_NONBLOCK | O_WRONLY | O_CLOEXEC;
-		if (fifo){
-/* this is susceptible to the normal race conditions, but we also expect
- * APPL_TEMP to be mapped to a 'safe' path */
-			if (-1 == mkfifo(path, S_IRWXU)){
-				if (errno != EEXIST || -1 == stat(path, &fi) || !S_ISFIFO(fi.st_mode)){
-					arcan_warning("open_nonblock(): mkfifo (%s) failed\n", path);
-					LUA_ETRACE("open_nonblock", "mkfifo failed", 0);
-				}
-			}
-			unlink_fn = strdup(path);
-			ignerr = true;
-		}
-		else
-			fl |= O_CREAT;
-
-/* failure to open fifo can be expected, then opening will be deferred */
-		fd = open(path, fl, S_IRWXU);
-		if (-1 != fd && fifo && (-1 == fstat(fd, &fi) || !S_ISFIFO(fi.st_mode))){
-			close(fd);
-			LUA_ETRACE("open_nonblock", "opened file not fifo", 0);
-		}
-	}
-/* recall, socket binding is supposed to go to a 'safe' namespace, so
- * filesystem races are less than a concern than normally */
-	else if (use_socket){
-		struct sockaddr_un addr = {
-			.sun_family = AF_UNIX
-		};
-		size_t lim = COUNT_OF(addr.sun_path);
-		path = arcan_find_resource(str, namespace, ARES_FILE, NULL);
-		if (path || !(path = arcan_expand_resource(str, namespace))){
-			arcan_warning("open_nonblock(), refusing to overwrite file\n");
-			LUA_ETRACE("open_nonblock", "couldn't create socket", 0);
-		}
-
-		if (strlen(path) > lim - 1){
-			arcan_warning("open_nonblock(), socket path too long\n");
-			LUA_ETRACE("open_nonblock", "socket path too long", 0);
-		}
-		snprintf(addr.sun_path, lim, "%s", path);
-
-		metatable = "nonblockIOs";
-
-		fd = socket(AF_UNIX, SOCK_STREAM, 0);
-		if (-1 == fd){
-			arcan_warning("open_nonblock(): couldn't create socket\n");
-			arcan_mem_free(path);
-			LUA_ETRACE("open_nonblock", "couldn't create socket", 0);
-		}
-		fchmod(fd, S_IRWXU);
-
-		alt_nbio_nonblock_cloexec(fd, true);
-		int rv = bind(fd, (struct sockaddr*) &addr, sizeof(addr));
-		if (-1 == rv){
-			close(fd);
-			arcan_mem_free(path);
-			arcan_warning(
-				"open_nonblock(): bind (%s) failed: %s\n", path, strerror(errno));
-			LUA_ETRACE("open_nonblock", "couldn't bind socket", 0);
-		}
-		listen(fd, 5);
-		unlink_fn = path;
-		path = NULL; /* don't mark as pending */
-	}
-	else {
-retryopen:
-		path = arcan_find_resource(str, namespace, ARES_FILE, NULL);
-
-/* fifo and doesn't exist? create */
-		if (!path){
-			if (fifo && (path = arcan_expand_resource(str, namespace))){
-				if (-1 == mkfifo(path, S_IRWXU)){
-					arcan_warning("open_nonblock(): mkfifo (%s) failed\n", path);
-					LUA_ETRACE("open_nonblock", "mkfifo failed", 0);
-				}
-				goto retryopen;
-			}
-			else{
-				LUA_ETRACE("open_nonblock", "file does not exist", 0);
-			}
-		}
-/* normal file OR socket */
-		else{
-			fd = open(path, O_NONBLOCK | O_CLOEXEC | O_RDONLY);
-
-/* socket, 'connect mode' */
-			if (-1 == fd && errno == ENXIO){
-				fd = alt_nbio_socket(path, namespace, &unlink_fn);
-				wrmode = O_RDWR;
-			}
-		}
-
-		arcan_mem_free(path);
-		path = NULL;
-	}
-
-	if (fd < 0 && !ignerr){
-		arcan_mem_free(path);
-		LUA_ETRACE("open_nonblock", "couldn't open file", 0);
+	if (pfd.err){
+		LUA_ETRACE("open_nonblock", pfd.err, 0);
 	}
 
 	struct nonblock_io* conn = arcan_alloc_mem(
 			sizeof(struct nonblock_io),
 			ARCAN_MEM_BINDING, ARCAN_MEM_BZERO, ARCAN_MEMALIGN_NATURAL);
 
-	conn->fd = fd;
+	conn->fd = pfd.fd;
+	alt_nbio_nonblock_cloexec(pfd.fd, true);
 
 /* this little crutch was better than differentiating the userdata as the
  * support for polymorphism there is rather clunky */
-	conn->mode = wrmode;
-	conn->pending = path;
-	conn->unlink_fn = unlink_fn;
+	conn->mode = pfd.wrmode;
+	conn->pending = pfd.path;
+	conn->unlink_fn = pfd.unlink;
+	conn->data_handler = LUA_NOREF;
+	conn->write_handler = LUA_NOREF;
 
 	uintptr_t* dp = lua_newuserdata(L, sizeof(uintptr_t));
 	*dp = (uintptr_t) conn;
 
-	luaL_getmetatable(L, metatable);
+	luaL_getmetatable(L, pfd.metatable);
 	lua_setmetatable(L, -2);
 
 	LUA_ETRACE("open_nonblock", NULL, 1);
@@ -1020,7 +1230,9 @@ retryopen:
 
 void alt_nbio_data_out(lua_State* L, intptr_t tag)
 {
-	lua_rawgeti(L, LUA_REGISTRYINDEX, tag);
+	if (!lookup_registry(L, tag, LUA_TUSERDATA, "data-out"))
+		return;
+
 	struct nonblock_io** ibb = luaL_checkudata(L, -1, "nonblockIO");
 	struct nonblock_io* ib = *ibb;
 	lua_pop(L, 1);
@@ -1035,7 +1247,7 @@ void alt_nbio_data_out(lua_State* L, intptr_t tag)
 		return;
 
 /* no registered handler? then just ensure empty queue on finish/fail */
-	if (!ib->write_handler){
+	if (ib->write_handler == LUA_NOREF){
 		drop_all_jobs(ib);
 		return;
 	}
@@ -1043,7 +1255,9 @@ void alt_nbio_data_out(lua_State* L, intptr_t tag)
 /* the gpu locked is only interesting / useful for arcan where there are
  * certain restrictions on doing things while the GPU is locked, while still
  * being able to process other IO */
-	lua_rawgeti(L, LUA_REGISTRYINDEX, ib->write_handler);
+	if (!lookup_registry(L, ib->write_handler, LUA_TFUNCTION, "data-out-wh"))
+		return;
+
 	lua_pushboolean(L, status == 1);
 #ifdef WANT_ARCAN_BASE
 	lua_pushboolean(L, arcan_conductor_gpus_locked());
@@ -1058,14 +1272,15 @@ void alt_nbio_data_out(lua_State* L, intptr_t tag)
  * unref:d */
 	if (!ib->out_queue){
 		if (remove_job(ib->fd, O_WRONLY, &tag)){
-			luaL_unref(L, LUA_REGISTRYINDEX, tag);
+			unref_registry(L, tag, LUA_TUSERDATA, "nbio-open-wrmeta");
 		}
 	}
 }
 
 void alt_nbio_data_in(lua_State* L, intptr_t tag)
 {
-	lua_rawgeti(L, LUA_REGISTRYINDEX, tag);
+	if (!lookup_registry(L, tag, LUA_TUSERDATA, "data-in"))
+		return;
 
 	struct nonblock_io** ibb = luaL_checkudata(L, -1, "nonblockIO");
 	struct nonblock_io* ib = *ibb;
@@ -1073,7 +1288,9 @@ void alt_nbio_data_in(lua_State* L, intptr_t tag)
 		return;
 
 	lua_pop(L, 1);
-	lua_rawgeti(L, LUA_REGISTRYINDEX, ib->data_handler);
+	if (!lookup_registry(L, ib->data_handler, LUA_TFUNCTION, "data-in-dh"))
+		return;
+
 	intptr_t ch = ib->data_handler;
 	ib->data_rearmed = false;
 
@@ -1092,20 +1309,16 @@ void alt_nbio_data_in(lua_State* L, intptr_t tag)
 	}
 /* or remove and assume that this is no longer wanted */
 	else {
-		luaL_unref(L, LUA_REGISTRYINDEX, ch);
+		unref_registry(L, ch, LUA_TFUNCTION, "data-in-dontwant");
+		ib->data_handler = LUA_NOREF;
 
 /* but make sure that we don't remove any data-out handler while at it */
 		if (remove_job(ib->fd, O_RDONLY, &tag)){
-			luaL_unref(L, LUA_REGISTRYINDEX, tag);
+			unref_registry(L, tag, LUA_TUSERDATA, "data-in-meta-dontwant");
 		}
 	}
 	lua_pop(L, 1);
 }
-
-/* this symbol comes parasitically with arcan-shmif and used inside the tui
- * implementation, thus it is not particularly nice to rely on it - on the
- * other hand vendoring in the code is also annoying */
-extern unsigned long long arcan_timemillis();
 
 /* set_position and seek are split to leave room for the theoretically possible
  * on sockets / pipes as a positive seek being (skip n bytes) */
@@ -1150,53 +1363,13 @@ static int nbio_flush(lua_State* L)
 	lua_pop(L, 1);
 
 /* if we have a write_handler it should be handled through the regular loop */
-	if (ib->write_handler || !ib->out_queue || ib->fd == -1){
+	if (ib->write_handler != LUA_NOREF || !ib->out_queue || ib->fd == -1){
 		lua_pushboolean(L, false);
 		return 1;
 	}
 
-	struct pollfd fd = {
-		.fd = ib->fd,
-		.events = POLLOUT | POLLERR | POLLHUP | POLLNVAL
-	};
-
-	bool rv = true;
-
-/* since poll doesn't give much in terms of feedback across calls some crude
- * timekeeping is needed to make sure we don't exceed a timeout by too much */
-	unsigned long long current = arcan_timemillis();
 	ssize_t timeout = luaL_optnumber(L, 2, -1);
-	int status;
-
-/* writes can fail.. */
-	while ((status = alt_nbio_process_write(L, ib)) == 0){
-
-		if (timeout > 0){
-			unsigned long long now = arcan_timemillis();
-			if (now > current)
-				timeout -= now - current;
-			current = now;
-
-			if (timeout <= 0){
-				rv = false;
-				break;
-			}
-		}
-
-/* dst can die while waiting for write-state */
-		int rv = poll(&fd, 1, timeout);
-
-		if (-1 == rv && (errno == EAGAIN || errno == EINTR))
-				continue;
-
-		if (fd.revents & (POLLERR | POLLHUP | POLLNVAL)){
-			rv = false;
-			break;
-		}
-	}
-
-	if (status < 0)
-		rv = false;
+	bool rv = ensure_flush(L, ib, timeout);
 
 	lua_pushboolean(L, rv);
 	return 1;
@@ -1234,7 +1407,10 @@ bool alt_nbio_import(
 	*nbio = (struct nonblock_io){
 		.fd = fd,
 		.mode = mode,
-		.unlink_fn = (unlink_fn ? *unlink_fn : NULL)
+		.lfch = '\n',
+		.unlink_fn = (unlink_fn ? *unlink_fn : NULL),
+		.write_handler = LUA_NOREF,
+		.data_handler = LUA_NOREF,
 	};
 
 	if (out)
@@ -1249,10 +1425,12 @@ bool alt_nbio_import(
 
 void alt_nbio_register(lua_State* L,
 	bool (*add)(int fd, mode_t, intptr_t tag),
-	bool (*remove)(int fd, mode_t, intptr_t* out))
+	bool (*remove)(int fd, mode_t, intptr_t* out),
+	void (*error)(lua_State* L, int fd, intptr_t tag, const char*))
 {
 	add_job = add;
 	remove_job = remove;
+	trigger_error = error;
 
 	luaL_newmetatable(L, "nonblockIO");
 	lua_pushvalue(L, -1);

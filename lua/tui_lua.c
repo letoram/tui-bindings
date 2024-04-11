@@ -5,10 +5,6 @@
  * Simply append- the related functions to a Lua context, and you should be
  * able to open/connect using tui_open() -> context.
  *
- * TODO:
- *   [ ] detached (virtual) windows
- *   [ ] PUSH new_window
- *   [ ] apaste/vpaste does nothing - map to bchunk_in?
  */
 
 #include <arcan_shmif.h>
@@ -38,8 +34,7 @@
 #include "tui_lua.h"
 #include "nbio.h"
 #include "tui_popen.h"
-
-#define TUI_METATABLE	"Arcan TUI"
+#include "tui_lua_glob.h"
 
 #if LUA_VERSION_NUM == 501
 	#define lua_rawlen(x, y) lua_objlen(x, y)
@@ -52,6 +47,10 @@ static struct tui_cbcfg shared_cbcfg = {};
 #define COUNT_OF(x) \
 	((sizeof(x)/sizeof(0[x])) / ((size_t)(!(sizeof(x) % sizeof(0[x])))))
 #endif
+
+#define STRINGIFY(X) #X
+#define STRINGIFY_WRAP(X) STRINGIFY(X)
+#define LINE_AS_STRING __func__, STRINGIFY_WRAP(__LINE__)
 
 /*
  * convenience macro prolog for all TUI callbacks
@@ -125,17 +124,35 @@ static const char* match_udata(lua_State* L, ssize_t pos){
 }
 
 __attribute__((used))
-static void dump_traceback(lua_State* L)
+static void dump_ltop(lua_State* ctx, int i)
 {
-	lua_getglobal(L, "debug");
-	lua_getfield(L, -1, "traceback");
-	lua_call(L, 0, 1);
-	const char* trace = lua_tostring(L, -1);
-	printf("%s\n", trace);
-	lua_pop(L, 1);
-}
+	int t = lua_type(ctx, i);
+	if (i < 0)
+		i = lua_gettop(ctx) - i + 1;
 
-static void register_tuimeta(lua_State* L);
+	switch (t){
+	case LUA_TBOOLEAN:
+		fprintf(stderr, "%d\t%s\n", i, lua_toboolean(ctx, i) ? "true" : "false");
+	break;
+	case LUA_TSTRING:
+		fprintf(stderr, "%d\t'%s'\n", i, lua_tostring(ctx, i));
+	break;
+	case LUA_TNUMBER:
+		fprintf(stderr, "%d\t%g\n", i, lua_tonumber(ctx, i));
+	break;
+	case LUA_TUSERDATA:{
+		const char* type = match_udata(ctx, i);
+		if (type)
+			fprintf(stderr, "%d\tuserdata:%s\n", i, type);
+		else
+			fprintf(stderr, "%d\tuserdata(unknown)\n", i);
+	}
+	break;
+	default:
+		fprintf(stderr, "%d\t%s\n", i, lua_typename(ctx, t));
+	break;
+	}
+}
 
 __attribute__((used))
 static void dump_stack(lua_State* ctx)
@@ -145,33 +162,55 @@ static void dump_stack(lua_State* ctx)
 
 	for (size_t i = 1; i <= top; i++){
 		int t = lua_type(ctx, i);
-
-		switch (t){
-		case LUA_TBOOLEAN:
-			fprintf(stderr, "%zu\t%s\n", i, lua_toboolean(ctx, i) ? "true" : "false");
-		break;
-		case LUA_TSTRING:
-			fprintf(stderr, "%zu\t'%s'\n", i, lua_tostring(ctx, i));
-			break;
-		case LUA_TNUMBER:
-			fprintf(stderr, "%zu\t%g\n", i, lua_tonumber(ctx, i));
-			break;
-		case LUA_TUSERDATA:{
-			const char* type = match_udata(ctx, i);
-			if (type)
-				fprintf(stderr, "%zu\tuserdata:%s\n", i, type);
-			else
-				fprintf(stderr, "%zu\tuserdata(unknown)\n", i);
-		}
-		break;
-		default:
-			fprintf(stderr, "%zu\t%s\n", i, lua_typename(ctx, t));
-			break;
-		}
+		dump_ltop(ctx, i);
 	}
 
 	fprintf(stderr, "\n");
 }
+
+__attribute__((used))
+static void dump_traceback(lua_State* L)
+{
+	dump_stack(L);
+	lua_getglobal(L, "debug");
+	lua_getfield(L, -1, "traceback");
+	lua_call(L, 0, 1);
+	const char* trace = lua_tostring(L, -1);
+	printf("%s\n", trace);
+	lua_pop(L, 2);
+	dump_stack(L);
+}
+
+__attribute__((used))
+static void dump_state(struct tui_lmeta* T)
+{
+	fprintf(stderr,
+		"tui_state:\n"
+		"\thtable:%d\n"
+		"\twidget:%d\n\t\tstate:%d\n\t\tclosure:%d\n",
+		(int) T->href,
+		(int) T->widget_mode,
+		(int) (T->widget_state == LUA_NOREF ? -1 : T->widget_state),
+		(int) (T->widget_closure == LUA_NOREF ? -1 : T->widget_closure)
+	);
+
+	if (T->widget_mode != TWND_NORMAL){
+		fprintf(stderr, "widget-resolve:\n"),
+		fprintf(stderr, "state->");
+		lua_rawgeti(T->lua, LUA_REGISTRYINDEX, T->widget_state);
+		dump_ltop(T->lua, -1);
+		lua_pop(T->lua, 1);
+
+		fprintf(stderr, "closure->");
+		lua_rawgeti(T->lua, LUA_REGISTRYINDEX, T->widget_closure);
+		dump_ltop(T->lua, -1);
+		lua_pop(T->lua, 1);
+	}
+
+	dump_stack(T->lua);
+}
+
+static void register_tuimeta(lua_State* L);
 
 /*
  * convenience macro prolog for all TUI window bound lua->c functions
@@ -195,24 +234,30 @@ static void dump_stack(lua_State* ctx)
 	if (!meta || !meta->parent)\
 		luaL_error(L, "listview: API error, widget metadata freed");\
 	struct tui_lmeta* ib = meta->parent;\
-	if (!ib || !ib->tui || ib->widget_mode != TWND_LISTWND)\
-		luaL_error(L, "listview: API error, not in listview state");
+	if (!ib || !ib->tui)\
+		luaL_error(L, "readline: parent window closed");\
+	if (ib->widget_mode != TWND_LISTWND)\
+		return 0;
 
 #define TUI_BWNDDATA \
 	struct widget_meta* meta = luaL_checkudata(L, 1, "widget_bufferview");\
 	if (!meta || !meta->parent)\
 		luaL_error(L, "bufferview: API error, widget metadata freed");\
 	struct tui_lmeta* ib = meta->parent;\
-	if (!ib || !ib->tui || ib->widget_mode != TWND_BUFWND)\
-		luaL_error(L, "bufferview: API error, not in bufferview state");
+	if (!ib || !ib->tui)\
+		luaL_error(L, "readline: parent window closed");\
+	if (ib->widget_mode != TWND_BUFWND)\
+		return 0;
 
 #define TUI_READLINEDATA \
 	struct widget_meta* meta = luaL_checkudata(L, 1, "widget_readline");\
 	if (!meta || !meta->parent)\
 		luaL_error(L, "readline: API error, widget metadata freed");\
 	struct tui_lmeta* ib = meta->parent;\
-	if (!ib || !ib->tui || ib->widget_mode != TWND_READLINE)\
-		luaL_error(L, "window not in readline state");
+	if (!ib || !ib->tui)\
+		luaL_error(L, "readline: parent window closed");\
+	if (ib->widget_mode != TWND_READLINE)\
+		return 0;
 
 static void init_lmeta(lua_State* L, struct tui_lmeta* l, struct tui_lmeta* p)
 {
@@ -267,6 +312,36 @@ static int intblint(lua_State* L, int ind, const char* field, bool* ok)
 	int rv = lua_tointeger(L, -1);
 	lua_pop(L, 1);
 	return rv;
+}
+
+static intptr_t tui_lref(lua_State* L,
+	int ind, const char* func, const char* src, int type)
+{
+	if (lua_type(L, ind) != type){
+		luaL_error(L, "requested ref of unexpected type");
+		return LUA_NOREF;
+	}
+
+	lua_pushvalue(L, ind);
+	intptr_t ret = luaL_ref(L, LUA_REGISTRYINDEX);
+
+	return ret;
+}
+
+static intptr_t tui_lunref(lua_State* L, intptr_t val, const char* src, int type)
+{
+	if (val == LUA_NOREF)
+		return LUA_NOREF;
+
+	lua_rawgeti(L, LUA_REGISTRYINDEX, val);
+	if (lua_type(L, -1) != type){
+		luaL_error(L, "requested unref of unexpected type");
+		return LUA_NOREF;
+	}
+	lua_pop(L, 1);
+
+	luaL_unref(L, LUA_REGISTRYINDEX, val);
+	return LUA_NOREF;
 }
 
 static struct tui_constraints get_wndhint(struct tui_lmeta* ib, lua_State* L, int ind)
@@ -356,7 +431,7 @@ static void on_mouse_button(struct tui_context* T,
 }
 
 static void on_key(struct tui_context* T, uint32_t xkeysym,
-	uint8_t scancode, uint8_t mods, uint16_t subid, void* t)
+	uint8_t scancode, uint16_t mods, uint16_t subid, void* t)
 {
 	SETUP_HREF("key",);
 		lua_pushnumber(L, subid);
@@ -666,9 +741,7 @@ static bool on_subwindow(struct tui_context* T,
 /* handover windows normally do not need to be tracked or part of the parent
  * process loop, except for when they are embedded */
 	if (type != TUI_WND_HANDOVER || nud->embed){
-/* cycle- reference ourselves */
-		lua_pushvalue(L, -1);
-		nud->tui_state = luaL_ref(L, LUA_REGISTRYINDEX);
+		nud->tui_state = tui_lref(L, -1, LINE_AS_STRING, LUA_TUSERDATA);
 
 /* register with parent so :process() hits the right hierarchy, the check for
  * pending-id + the check on request means that there there is a fitting slot
@@ -1007,14 +1080,10 @@ static void revert(lua_State* L, struct tui_lmeta* M)
 		if (M->widget_meta){
 			struct widget_meta* wm = M->widget_meta;
 
-			if (wm->readline.verify){
-				luaL_unref(L, LUA_REGISTRYINDEX, wm->readline.verify);
-				M->widget_meta->readline.verify = LUA_NOREF;
-			}
-			if (wm->readline.filter){
-				luaL_unref(L, LUA_REGISTRYINDEX, wm->readline.filter);
-				M->widget_meta->readline.filter = LUA_NOREF;
-			}
+			M->widget_meta->readline.verify =
+				tui_lunref(L, wm->readline.verify, "revert-readline-flt", LUA_TFUNCTION);
+			M->widget_meta->readline.filter =
+				tui_lunref(L, wm->readline.filter, "revert-readline-ver", LUA_TFUNCTION);
 
 /* There might be a case for actually not freeing the history in the case
  * where we build another readline, and in that case also allow appending
@@ -1036,14 +1105,33 @@ static void revert(lua_State* L, struct tui_lmeta* M)
 		M->widget_meta->parent = NULL;
 		M->widget_meta = NULL;
 	}
-	if (M->widget_closure != LUA_NOREF){
-		luaL_unref(L, LUA_REGISTRYINDEX, M->widget_closure);
-		M->widget_closure = LUA_NOREF;
-	}
-	if (M->widget_state != LUA_NOREF){
-		luaL_unref(L, LUA_REGISTRYINDEX, M->widget_state);
-		M->widget_state = LUA_NOREF;
-	}
+
+	M->widget_closure =
+		tui_lunref(L, M->widget_closure, "revert_full_closure", LUA_TFUNCTION);
+	M->widget_state =
+		tui_lunref(L, M->widget_state, "revert_full_state", LUA_TUSERDATA);
+}
+
+static void callback_revert(
+	lua_State* L, struct tui_lmeta* M, const char* src, int n, int r)
+{
+	intptr_t closure = M->widget_closure;
+	intptr_t state = M->widget_state;
+
+/* More onerous that it might seem, first we want the references themselves
+ * to be alive (uncertain how the tracking is when they are on the stack so
+ * this is the safer bet. We need the closure/state members reset though if
+ * the callback would cause a new widget state to be set (would happen with
+ * readline frequently). But it might also call revert/reset itself which
+ * then would clear the refs and we'd do double-unref. */
+	M->widget_closure = LUA_NOREF;
+	M->widget_state = LUA_NOREF;
+
+	revert(L, M);
+	RUN_CALLBACK(src, n, r);
+
+	tui_lunref(L, closure, "revert-callback-closure", LUA_TFUNCTION);
+	tui_lunref(L, state, "revert-callback-state", LUA_TUSERDATA);
 }
 
 static void apply_table(lua_State* L, int ind, struct tui_screen_attr* attr)
@@ -1336,7 +1424,7 @@ static int tui_local(lua_State* L)
 
 /* somewhere to derive color configuration from */
 	if (lua_type(L, ci) == LUA_TUSERDATA){
-		struct tui_lmeta* ib = luaL_checkudata(L, ci++, TUI_METATABLE);
+		ib = luaL_checkudata(L, ci++, TUI_METATABLE);
 		ci++;
 	}
 
@@ -1378,8 +1466,7 @@ ltui_inherit(lua_State* L, arcan_tui_conn* conn, struct tui_lmeta* T)
 		return NULL;
 	}
 	init_lmeta(L, meta, T);
-	lua_pushvalue(L, -1);
-	meta->tui_state = luaL_ref(L, LUA_REGISTRYINDEX);
+	meta->tui_state = tui_lref(L, -1, LINE_AS_STRING, LUA_TUSERDATA);
 
 /* make sure we know what directory we are in and that we hold a dirfd */
 	synch_wd(meta);
@@ -1423,7 +1510,8 @@ ltui_inherit(lua_State* L, arcan_tui_conn* conn, struct tui_lmeta* T)
 	if (lua_type(L, 3) == LUA_TTABLE){
 		lua_getfield(L, 3, "handlers");
 		if (lua_type(L, -1) == LUA_TTABLE){
-			meta->href = luaL_ref(L, LUA_REGISTRYINDEX);
+			meta->href = tui_lref(L, -1, LINE_AS_STRING, LUA_TTABLE);
+			lua_pop(L, 1);
 		}
 		else{
 			lua_pop(L, 1);
@@ -1473,8 +1561,7 @@ static int tuiclose(lua_State* L)
 
 	arcan_tui_destroy(ib->tui, luaL_optstring(L, 2, NULL));
 	ib->tui = NULL;
-	luaL_unref(L, LUA_REGISTRYINDEX, ib->tui_state);
-	ib->tui_state = LUA_NOREF;
+	ib->tui_state = tui_lunref(L, ib->tui_state, "close", LUA_TUSERDATA);
 
 /* deregister from parent list of subs by finding and compacting */
 	if (ib->parent){
@@ -1515,10 +1602,7 @@ static int collect(lua_State* L)
 		ib->tui = NULL;
 	}
 
-	if (ib->href != LUA_NOREF){
-		luaL_unref(L, LUA_REGISTRYINDEX, ib->href);
-		ib->href = LUA_NOREF;
-	}
+	ib->href = tui_lunref(L, ib->href, "tui-collect", LUA_TTABLE);
 
 	free(ib->cwd);
 	ib->cwd = NULL;
@@ -1536,15 +1620,8 @@ static int settbl(lua_State* L)
 	TUI_UDATA;
 
 /* remove the existing table */
-	if (ib->href != LUA_NOREF){
-		luaL_unref(L, LUA_REGISTRYINDEX, ib->href);
-		ib->href = LUA_NOREF;
-	}
-
-/* ensure that we get the handler table, and balance the stack */
-	luaL_checktype(L, 2, LUA_TTABLE);
-	lua_pushvalue(L, 2);
-	ib->href = luaL_ref(L, LUA_REGISTRYINDEX);
+	ib->href = tui_lunref(L, ib->href,  "tui-settable", LUA_TTABLE);
+	ib->href = tui_lref(L, 2, LINE_AS_STRING, LUA_TTABLE);
 
 	return 0;
 }
@@ -1580,8 +1657,7 @@ static int reqwnd(lua_State* L)
 	int ind;
 	intptr_t ref = LUA_NOREF;
 	if ( (ind = 2, lua_isfunction(L, 2)) || (ind = 3, lua_isfunction(L, 3)) ){
-		lua_pushvalue(L, ind);
-		ref = luaL_ref(L, LUA_REGISTRYINDEX);
+		ref = tui_lref(L, ind, LINE_AS_STRING, LUA_TFUNCTION);
 	}
 	else
 		luaL_error(L, "new_window(type, >closure<, ...) closure missing");
@@ -1710,19 +1786,15 @@ static int alive(lua_State* L)
 
 /* correlate a bitmap of indices to the map of file descriptors to uintptr_t
  * tags, collect them in a set and forward to alt_nbio */
-static int run_bitmap(lua_State* L, int map)
+static size_t queue_bitmap(uintptr_t set[static 32], int map)
 {
-	uintptr_t set[32];
-	int count = 0;
+	size_t count = 0;
 	while (ffs(map) && count < 32){
 		int pos = ffs(map)-1;
 		map &= ~(1 << pos);
 		set[count++] = nbio_jobs.fdin_tags[pos];
 	}
-	for (int i = 0; i < count; i++){
-		alt_nbio_data_in(L, set[i]);
-	}
-	return map;
+	return count;
 }
 
 static void run_sub_bitmap(struct tui_lmeta* ib, int map)
@@ -1779,8 +1851,7 @@ static void process_widget(lua_State* L, struct tui_lmeta* T)
 			else {
 				lua_pushnil(L);
 			}
-			revert(L, T);
-			RUN_CALLBACK("listwnd_ok", 1, 0);
+			callback_revert(L, T, "listwnd_ok", 1, 0);
 		}
 	}
 	break;
@@ -1799,8 +1870,7 @@ static void process_widget(lua_State* L, struct tui_lmeta* T)
 		else if (sc == -1){
 			lua_pushnil(L);
 		}
-		revert(L, T);
-		RUN_CALLBACK("bufferview_ok", 2, 0);
+		callback_revert(L, T, "bufferview_ok", 2, 0);
 	}
 
 	break;
@@ -1816,10 +1886,7 @@ static void process_widget(lua_State* L, struct tui_lmeta* T)
 			else {
 				lua_pushnil(L);
 			}
-/* Restore the context to its initial state so that the closure is allowed to
- * request a new readline request. Revert will actually free buf. */
-			revert(L, T);
-			RUN_CALLBACK("readline_ok", 2, 0);
+			callback_revert(L, T, "readline_ok", 2, 0);
 		}
 	}
 	break;
@@ -1843,7 +1910,6 @@ repoll:
 	if (res.errc == TUI_ERRC_BAD_CTX){
 		if (ib->n_subs){
 			run_sub_bitmap(ib, res.bad);
-			compact(ib);
 		}
 
 		if (1 & res.bad){
@@ -1855,12 +1921,17 @@ repoll:
 		goto repoll;
 	}
 
-/* Only care about bad vs ok, nbio will do the rest. For both inbound and
- * outbound job triggers we need to first cache the tags on the stack, then
- * trigger the nbio as nbio_jobs may be modified from the nbio_data call */
+/* Regardless of ok or bad, just add to a set and process it - the sets do not
+ * have an intersection so anything in ok won't be in bad. The reason for this
+ * to be queued into a temporary buffer is that the alt_nbio_data_in call can
+ * modify the process bitmap used and the offsets would be wrong */
 	if (nbio_jobs.fdin_used && (res.bad || res.ok)){
-		res.ok = run_bitmap(L, res.ok);
-		res.bad = run_bitmap(L, res.bad);
+		uintptr_t set[64];
+		size_t count = 0;
+		count += queue_bitmap(set, res.ok);
+		count += queue_bitmap(&set[count], res.bad);
+		for (size_t i = 0; i < count; i++)
+			alt_nbio_data_in(L, set[i]);
 	}
 
 /* _process only multiplexes on inbound so we need to flush outbound as well */
@@ -1917,8 +1988,7 @@ static int write_border(lua_State* L)
 	size_t y2 = luaL_checkinteger(L, 5);
 	int fl = luaL_optinteger(L, 7, 0);
 
-	struct tui_screen_attr mattr;
-	arcan_tui_defattr(ib->tui, &mattr);
+	struct tui_screen_attr mattr = arcan_tui_defattr(ib->tui, NULL);
 
 	if (lua_type(L, 6) == LUA_TTABLE){
 		apply_table(L, 6, &mattr);
@@ -1933,7 +2003,6 @@ static int write_tou8(lua_State* L)
 	TUI_UDATA;
 	struct tui_screen_attr* attr = NULL;
 	struct tui_screen_attr mattr = {};
-	arcan_tui_defattr(ib->tui, &mattr);
 	size_t len;
 
 	size_t x = luaL_checkinteger(L, 2);
@@ -2110,6 +2179,14 @@ static int request_io(lua_State* L)
 	const char* input = luaL_optstring(L, 2, "");
 	const char* output = luaL_optstring(L, 3, "");
 	arcan_tui_announce_io(ib->tui, true, input, output);
+	return 0;
+}
+
+static int announce_cursor_io(lua_State* L)
+{
+	TUI_UDATA;
+	const char* descr = luaL_optstring(L, 2, NULL);
+	arcan_tui_announce_cursor_io(ib->tui, descr);
 	return 0;
 }
 
@@ -2308,24 +2385,20 @@ static int readline(lua_State* L)
 			arcan_tui_utf8ucs4(lua_tostring(L, -1), &opts.mask_character);
 		}
 		lua_pop(L, 1);
+
 		lua_getfield(L, tbl, "verify");
-		if (lua_isfunction(L, -1) && !lua_iscfunction(L, -1)){
-			meta->readline.verify = luaL_ref(L, LUA_REGISTRYINDEX);
-		}
-		else
-			lua_pop(L, 1);
+		if (lua_isfunction(L, -1) && !lua_iscfunction(L, -1))
+			meta->readline.verify = tui_lref(L, -1, LINE_AS_STRING, LUA_TFUNCTION);
+		lua_pop(L, 1);
+
 		lua_getfield(L, tbl, "filter");
-		if (lua_isfunction(L, -1) && !lua_iscfunction(L, -1)){
-			meta->readline.filter = luaL_ref(L, LUA_REGISTRYINDEX);
-		}
-		else
-			lua_pop(L, 1);
+		if (lua_isfunction(L, -1) && !lua_iscfunction(L, -1))
+			meta->readline.filter = tui_lref(L, -1, LINE_AS_STRING, LUA_TFUNCTION);
+		lua_pop(L, 1);
 	}
 
 /* 3. grab closure, set as widget */
-	lua_pushvalue(L, ofs);
-	ib->widget_closure = luaL_ref(L, LUA_REGISTRYINDEX);
-
+	ib->widget_closure = tui_lref(L, ofs, LINE_AS_STRING, LUA_TFUNCTION);
 	ib->widget_mode = TWND_READLINE;
 	meta->parent = ib;
 	ib->widget_meta = meta;
@@ -2344,8 +2417,7 @@ static int readline(lua_State* L)
 /* 5. save a reference to the widget context in order to forward it in
  *    callback handlers later
  */
-	lua_pushvalue(L, -1);
-	ib->widget_state = luaL_ref(L, LUA_REGISTRYINDEX);
+	ib->widget_state = tui_lref(L, -1, LINE_AS_STRING, LUA_TUSERDATA);
 
 	return 1;
 }
@@ -2456,17 +2528,14 @@ static int bufferwnd(lua_State* L)
 
 	ib->widget_mode = TWND_BUFWND;
 	ib->widget_meta = meta;
-
-	lua_pushvalue(L, 3);
-	ib->widget_closure = luaL_ref(L, LUA_REGISTRYINDEX);
+	ib->widget_closure = tui_lref(L, 3, LINE_AS_STRING, LUA_TFUNCTION);
 
 	lua_pushvalue(L, 1);
 	arcan_tui_bufferwnd_setup(ib->tui,
 		meta->bufferview.buf, meta->bufferview.sz, &opts, sizeof(opts));
 	lua_pop(L, 1);
 
-	lua_pushvalue(L, -1);
-	ib->widget_state = luaL_ref(L, LUA_REGISTRYINDEX);
+	ib->widget_state = tui_lref(L, -1, LINE_AS_STRING, LUA_TUSERDATA);
 
 	return 1;
 }
@@ -2531,16 +2600,14 @@ static int listwnd(lua_State* L)
 
 	ib->widget_mode = TWND_LISTWND;
 	ib->widget_meta = meta;
-	lua_pushvalue(L, 3);
-	ib->widget_closure = luaL_ref(L, LUA_REGISTRYINDEX);
+	ib->widget_closure = tui_lref(L, 3, LINE_AS_STRING, LUA_TFUNCTION);
 
 /* switch mode and build return- userdata */
 	lua_pushvalue(L, 1);
 	arcan_tui_listwnd_setup(ib->tui, meta->listview.ents, meta->listview.n_ents);
 	lua_pop(L, 1);
 
-	lua_pushvalue(L, -1);
-	ib->widget_state = luaL_ref(L, LUA_REGISTRYINDEX);
+	ib->widget_state = tui_lref(L, -1, LINE_AS_STRING, LUA_TUSERDATA);
 	return 1;
 }
 
@@ -2704,16 +2771,13 @@ static int readline_suggest(lua_State* L)
 			if (hint_ext){
 				lua_getfield(L, index, "hint");
 				lua_rawgeti(L, -1, i+1);
+				const char* a2 = "";
 				if (lua_type(L, -1) == LUA_TSTRING){
-					const char* a2 = lua_tostring(L, -1);
-					size_t len = strlen(a1) + strlen(a2) + 2;
-					new_suggest[i] = malloc(strlen(a1) + strlen(a2) + 2);
-					if (new_suggest[i]){
-						snprintf(new_suggest[i], len, "%s%c%s", a1, (char) 0, a2);
-					}
+					a2 = lua_tostring(L, -1);
 				}
-				else
-					new_suggest[i] = strdup(a1);
+				size_t len = strlen(a1) + strlen(a2) + 2;
+				new_suggest[i] = malloc(strlen(a1) + strlen(a2) + 2);
+				snprintf(new_suggest[i], len, "%s%c%s", a1, (char) 0, a2);
 				lua_pop(L, 2);
 			}
 			else{
@@ -3038,10 +3102,20 @@ static bool queue_nbio(int fd, mode_t mode, intptr_t tag)
 	return true;
 }
 
+static void error_nbio(lua_State* L, int fd, intptr_t tag, const char* src)
+{
+#ifdef _DEBUG
+	fprintf(stderr, "unexpected error in nbio(%s)\n", src);
+	dump_stack(L);
+#endif
+}
+
 static bool dequeue_nbio(int fd, mode_t mode, intptr_t* tag)
 {
 	bool found = false;
 
+/* need this to be compact and match both the tags and the descriptors,
+ * so separate move and reduce total count */
 	for (size_t i = 0; mode == O_RDONLY && i < nbio_jobs.fdin_used; i++){
 		if (nbio_jobs.fdin[i] == fd){
 			memmove(
@@ -3065,6 +3139,7 @@ static bool dequeue_nbio(int fd, mode_t mode, intptr_t* tag)
 		if (nbio_jobs.fdout[i].fd == fd){
 			if (tag)
 				*tag = nbio_jobs.fdout_tags[i];
+			nbio_jobs.fdout_used--;
 
 			memmove(
 				&nbio_jobs.fdout_tags[i],
@@ -3078,7 +3153,6 @@ static bool dequeue_nbio(int fd, mode_t mode, intptr_t* tag)
 				(nbio_jobs.fdout_used - i) * sizeof(struct pollfd)
 			);
 
-			nbio_jobs.fdout_used--;
 			found = true;
 			break;
 		}
@@ -3329,6 +3403,13 @@ static int tui_tpack(lua_State* L)
 	return 1;
 }
 
+static int debug(lua_State* L)
+{
+	TUI_UDATA;
+	dump_state(ib);
+	return 0;
+}
+
 static int tui_screencopy(lua_State* L)
 {
 	TUI_UDATA;
@@ -3415,6 +3496,7 @@ static void register_tuimeta(lua_State* L)
 {
 	struct luaL_Reg tui_methods[] = {
 		{"alive", alive},
+		{"debugtrigger", debug},
 		{"process", process},
 		{"refresh", refresh},
 		{"write", writeu8},
@@ -3439,6 +3521,7 @@ static void register_tuimeta(lua_State* L)
 		{"set_flags", set_flags},
 		{"announce_io", announce_io},
 		{"request_io", request_io},
+		{"announce_cursor_io", announce_cursor_io},
 		{"alert", alert},
 		{"notification", notification},
 		{"failure", failure},
@@ -3459,6 +3542,7 @@ static void register_tuimeta(lua_State* L)
 		{"funlink", tui_funlink},
 		{"frename", tui_frename},
 		{"fstatus", tui_fstatus},
+		{"fglob", tui_glob},
 		{"bgcopy", tui_fbond},
 		{"getenv", tui_getenv},
 		{"chdir", tui_chdir},
@@ -3485,7 +3569,7 @@ static void register_tuimeta(lua_State* L)
 		lua_pushcfunction(L, tui_tostring);
 		lua_setfield(L, -2, "__tostring");
 
-		alt_nbio_register(L, queue_nbio, dequeue_nbio);
+		alt_nbio_register(L, queue_nbio, dequeue_nbio, error_nbio);
 	}
 	lua_pop(L, 1);
 

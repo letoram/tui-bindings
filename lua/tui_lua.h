@@ -39,6 +39,8 @@
 #define SEGMENT_LIMIT 64
 struct blobio_meta;
 
+#define TUI_METATABLE	"Arcan TUI"
+
 enum tui_builtin_widgets {
 	TWND_NORMAL = 0,
 	TWND_LISTWND = 1,
@@ -52,7 +54,6 @@ struct tui_lmeta;
 struct widget_meta {
 	struct tui_lmeta* parent;
 
-	int widget_type;
 	union {
 		struct {
 			intptr_t verify;
@@ -123,6 +124,7 @@ struct tui_lmeta {
 	intptr_t widget_closure;
 	intptr_t widget_state;
 	struct widget_meta* widget_meta;
+	bool in_callback;
 
 /* linked list of bchunk like processing jobs */
 	struct blobio_meta* blobs;
