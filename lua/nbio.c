@@ -45,11 +45,6 @@ void arcan_random(uint8_t* dst, size_t sz);
 #ifdef WANT_ARCAN_BASE
 #define arcan_fatal(...) do { alt_fatal( __VA_ARGS__); } while(0)
 #else
-static void arcan_warning(const char* msg)
-{
-	fprintf(stderr, "%s\n", msg);
-}
-
 #define arcan_fatal(X) do { lua_pushliteral(L, X); lua_error(L); } while(0)
 #endif
 
@@ -870,7 +865,7 @@ int alt_nbio_process_read(
 			count &&
 	/* same caveat as above, striplf mode can cause len == 0 with step+1
 	 * at end-of-full buffer causing ci to overstep buffer cap */
-			ci < ib->ofs,
+			ci < ib->ofs &&
 			(ch = nextline(ib, ci, eof, &len, &step, &gotline, ib->lfch))){
 			if (eof && len == 0 && step == 0)
 				break;
