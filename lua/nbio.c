@@ -33,12 +33,24 @@
 #include "nbio.h"
 #include "nbio_local.h"
 
+/*
+ * comes with shmif but not exported
+ */
+void arcan_random(uint8_t* dst, size_t sz);
+
 #if LUA_VERSION_NUM == 501
 	#define lua_rawlen(x, y) lua_objlen(x, y)
 #endif
 
 #ifdef WANT_ARCAN_BASE
 #define arcan_fatal(...) do { alt_fatal( __VA_ARGS__); } while(0)
+#else
+static void arcan_warning(const char* msg)
+{
+	fprintf(stderr, "%s\n", msg);
+}
+
+#define arcan_fatal(X) do { lua_pushliteral(L, X); lua_error(L); } while(0)
 #endif
 
 static struct nonblock_io open_fds[LUACTX_OPEN_FILES];
@@ -189,8 +201,9 @@ int alt_nbio_socket(const char* path, int ns, char** out)
  * retry counter to counteract the rare collision vs. permanent problem */
 	do {
 		char tmpname[32];
-		long rnd = random();
-		snprintf(tmpname, sizeof(tmpname), "/tmp/_sock%ld_%d", rnd, getpid());
+		uint32_t rnd;
+		arcan_random((uint8_t*) &rnd, 4);
+		snprintf(tmpname, sizeof(tmpname), "/tmp/_sock%"PRIu32"_%d", rnd, getpid());
 		char* tmppath = arcan_find_resource(tmpname, ns, ARES_FILE, NULL);
 		if (!tmppath){
 			local_path = arcan_expand_resource(tmpname, ns);
@@ -279,22 +292,34 @@ static void drop_all_jobs(struct nonblock_io* ib)
 	ib->out_count = 0;
 }
 
-static struct io_job* queue_out(struct nonblock_io* ib, const char* buf, size_t len)
+static struct io_job* queue_out(struct nonblock_io* ib,
+	const char* buf, size_t len, const char* suffix, size_t suffix_len)
 {
+/* attempted overflow with overly long suffix */
+	if (suffix_len + len < len)
+		return NULL;
+
 	struct io_job* res = malloc(sizeof(struct io_job));
 	if (!res)
 		return NULL;
 
 /* prepare new write job */
 	*res = (struct io_job){0};
-	res->buf = malloc(len);
+	res->buf = malloc(len + suffix_len);
 	if (!res->buf){
 		free(res);
 		return NULL;
 	}
 
-/* copy out so lua can drop the buffer */
+/* copy out so lua can drop the buffer, note that neither buf nor suffix
+ * will consider the trailing \0 if it's even there */
 	memcpy(res->buf, buf, len);
+
+	if (suffix_len){
+		memcpy(&res->buf[len], suffix, suffix_len);
+		len += suffix_len;
+	}
+
 	res->sz = len;
 	ib->out_queued += len;
 
@@ -607,28 +632,45 @@ static int nbio_write(lua_State* L)
 		iw->write_handler = luaL_ref(L, LUA_REGISTRYINDEX);
 	}
 
-/* means we have a table, iterate and queue each entry */
+/* means we have a table, iterate and queue each entry, queue_out will make a
+ * copy so there is no risk for tolstring cause a UAF on GC. Allow a table
+ * defined suffix in order to pass custom linefeeds in case of a stripped
+ * source */
 	if (!len){
+		lua_getfield(L, 2, "suffix");
+		char* suffix = NULL;
+		size_t suffix_len = 0;
+		if (lua_type(L, -1) == LUA_TSTRING){
+			suffix = strdup(lua_tolstring(L, -1, &suffix_len));
+		}
+		lua_pop(L, 1);
+
 		int count = lua_rawlen(L, 2);
 		for (ssize_t i = 0; i < count; i++){
 			lua_rawgeti(L, 2, i+1);
 			buf = lua_tolstring(L, -1, &len);
 			if (!len){
-				lua_pop(L, 1);
-				continue;
+				if (!suffix_len){
+					lua_pop(L, 1);
+					continue;
+				}
+				buf = "";
+				len = 0;
 			}
-			if (!buf || !queue_out(iw, buf, len)){
+
+			if (!buf || !queue_out(iw, buf, len, suffix, suffix_len)){
 				drop_all_jobs(iw);
 				lua_pop(L, 1);
 				lua_pushnumber(L, 0);
 				lua_pushboolean(L, false);
+				free(suffix);
 				LUA_ETRACE("open_nonblock:write", "couldn't queue buffer", 2);
 			}
 			lua_pop(L, 1);
 		}
 	}
 	else {
-		if (!queue_out(iw, buf, len)){
+		if (!queue_out(iw, buf, len, NULL, 0)){
 			lua_pushnumber(L, 0);
 			lua_pushboolean(L, false);
 			LUA_ETRACE("open_nonblock:write", NULL, 2);
@@ -657,17 +699,30 @@ static int nbio_write(lua_State* L)
 	LUA_ETRACE("open_nonblock:write", NULL, 2);
 }
 
-static char* nextline(struct nonblock_io* ib,
-	size_t start, bool eof, size_t* nb, size_t* step,
-	bool* gotline, char linech)
+static char* nextline(
+	struct nonblock_io* ib,
+	size_t start,  /* IN: offset from ib->buf to start processing from */
+	bool eof,      /* IN: is the source alive? */
+	size_t* nb,    /* INOUT: number of bytes to consume */
+	size_t* step,  /* INOUT: number of bytes to skip, doesn't need to == nb */
+	bool* gotline, /* OUT: did we retrieve a full line or capped by bufsz */
+	char linech    /* IN: character used for separation */
+	)
 {
+
+/* empty input buffer? early - out */
 	if (!ib->ofs)
 		return NULL;
 
 	*step = 0;
 
+/* consume each character in buffer */
 	for (size_t i = start; i < ib->ofs; i++){
+
+/* if we match linefeed at our current position we are done */
 		if (ib->buf[i] == linech){
+
+/* some callers want the character to remain, others will strip it */
 			*nb = ib->lfstrip ? (i - start) : (i - start) + 1;
 			*step = (i - start) + 1;
 			*gotline = true;
@@ -675,8 +730,10 @@ static char* nextline(struct nonblock_io* ib,
 		}
 	}
 
+/* we are full without separator or at end-of-source */
 	if (eof || (!start && ib->ofs == COUNT_OF(ib->buf))){
 		*gotline = false;
+
 		if (ib->ofs < start){
 			*nb = 0;
 			*step = 0;
@@ -757,9 +814,10 @@ int alt_nbio_process_read(
  * 3. forward to the callback at -1.
  */
 #define SLIDE(X) do{\
-	memmove(ib->buf, &ib->buf[ci], ib->ofs - ci);\
-	ib->ofs -= ci;\
-}while(0)
+	if (ci <= ib->ofs){\
+		memmove(ib->buf, &ib->buf[ci], ib->ofs - ci);\
+		ib->ofs -= ci;\
+}} while(0)
 	bool gotline;
 
 	if (lua_type(L, -1) == LUA_TFUNCTION){
@@ -779,7 +837,12 @@ int alt_nbio_process_read(
 			lua_pushboolean(L, eof && !gotline);
 			ci += step;
 			alt_call(L, CB_SOURCE_NONE, 0, 2, 1, LINE_TAG":read_cb");
-			cancel = lua_toboolean(L, -1);
+
+/* the caller doesn't want more data (right now) OR the offset has
+ * been incremented past buffer constraints when there is <LF><EOF>
+ * as step will be 1 <= step <= ofs could cause nextline called at
+ * a start beyond end of buffer */
+			cancel = lua_toboolean(L, -1) || ib->ofs <= ci;
 			lua_pop(L, 1);
 		}
 
@@ -793,8 +856,10 @@ int alt_nbio_process_read(
 		size_t ind = lua_rawlen(L, -1) + 1;
 		size_t ci = 0;
 
-	/* let the table set ceiling on the number of lines per call, if the field
- * isnt't there count will be set to 0 and we just turn it into SIZET_MAX */
+/* let the table set ceiling on the number of lines per call, if the field
+ * isnt't there count will be set to 0 and we just turn it into SIZET_MAX.
+ * The use-case for this is to be able to yield cothreads between table
+ * reads. */
 		lua_getfield(L, -1, "read_cap");
 		size_t count = lua_tonumber(L, -1);
 		if (!count)
@@ -803,6 +868,9 @@ int alt_nbio_process_read(
 
 	while (
 			count &&
+	/* same caveat as above, striplf mode can cause len == 0 with step+1
+	 * at end-of-full buffer causing ci to overstep buffer cap */
+			ci < ib->ofs,
 			(ch = nextline(ib, ci, eof, &len, &step, &gotline, ib->lfch))){
 			if (eof && len == 0 && step == 0)
 				break;
@@ -811,8 +879,10 @@ int alt_nbio_process_read(
 			lua_pushlstring(L, ch, len);
 			lua_rawset(L, -3);
 			count--;
+
 			ci += step;
 		}
+
 		SLIDE();
 		lua_pushnil(L);
 		lua_pushboolean(L, !eof);
@@ -821,8 +891,13 @@ int alt_nbio_process_read(
 	else {
 		if ((ch = nextline(ib, 0, eof, &len, &step, &gotline, ib->lfch))){
 			lua_pushlstring(L, ch, len);
-			memmove(ib->buf, &ib->buf[step], buf_sz - step);
-			ib->ofs -= step;
+
+			if (step < ib->ofs){
+				memmove(ib->buf, &ib->buf[step], buf_sz - step);
+				ib->ofs -= step;
+			}
+			else
+				ib->ofs = 0;
 		}
 		else
 			lua_pushnil(L);
@@ -830,6 +905,18 @@ int alt_nbio_process_read(
 		lua_pushboolean(L, !eof);
 		return 2;
 	}
+}
+
+lua_Number luaL_checkbnumber(lua_State* L, int narg)
+{
+	lua_Number d = lua_tonumber(L, narg);
+	if (d == 0 && !lua_isnumber(L, narg)){
+		if (!lua_isboolean(L, narg))
+			luaL_argerror(L, narg, "number or boolean");
+		else
+			d = lua_toboolean(L, narg);
+	}
+	return d;
 }
 
 static int nbio_lf(lua_State* L)
@@ -885,7 +972,7 @@ static int opennonblock_tgt(lua_State* L, bool wr)
 	const char* type = luaL_optstring(L, 3, "stream");
 	struct arcan_event ev = {
 		.category = EVENT_TARGET,
-		.tgt.kind = wr ? TARGET_COMMAND_BCHUNK_IN : TARGET_COMMAND_BCHUNK_OUT
+		.tgt.kind = wr ? TARGET_COMMAND_BCHUNK_OUT : TARGET_COMMAND_BCHUNK_IN
 	};
 	snprintf(ev.tgt.message, COUNT_OF(ev.tgt.message), "%s", type);
 	if (lua_type(L, 4) == LUA_TUSERDATA){
@@ -1209,6 +1296,7 @@ int alt_nbio_open(lua_State* L)
 			ARCAN_MEM_BINDING, ARCAN_MEM_BZERO, ARCAN_MEMALIGN_NATURAL);
 
 	conn->fd = pfd.fd;
+	conn->lfch = '\n';
 	alt_nbio_nonblock_cloexec(pfd.fd, true);
 
 /* this little crutch was better than differentiating the userdata as the
@@ -1330,7 +1418,19 @@ static int nbio_seek(lua_State* L)
 		arcan_fatal("nbio:seek on closed file");
 
 	lua_Number ofs = lua_tonumber(L, 1);
-	off_t pos = lseek(ib->fd, ofs, SEEK_CUR);
+	bool relative = luaL_optbnumber(L, 2, true);
+	off_t pos;
+
+	if (!relative){
+		pos = lseek(ib->fd, ofs, SEEK_SET);
+	}
+	else {
+		if (ofs < 0){
+			pos = lseek(ib->fd, -ofs, SEEK_END);
+		}
+		else
+			pos = lseek(ib->fd, ofs, SEEK_CUR);
+	}
 
 	lua_pushboolean(L, pos != -1);
 	lua_pushnumber(L, pos);
