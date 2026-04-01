@@ -38,6 +38,9 @@ static bool nbio_dequeue(int fd, mode_t mode, intptr_t* tag)
  * so separate move and reduce total count */
 	for (size_t i = 0; mode == O_RDONLY && i < nbio_jobs.fdin_used; i++){
 		if (nbio_jobs.fdin[i] == fd){
+			if (tag)
+				*tag = nbio_jobs.fdin_tags[i];
+
 			memmove(
 				&nbio_jobs.fdin_tags[i],
 				&nbio_jobs.fdin_tags[i+1],
@@ -49,6 +52,9 @@ static bool nbio_dequeue(int fd, mode_t mode, intptr_t* tag)
 				&nbio_jobs.fdin[i+1],
 				(nbio_jobs.fdin_used - i) * sizeof(int)
 			);
+			nbio_jobs.fdin_tags[i+1] = LUA_NOREF;
+			nbio_jobs.fdin[i+1] = -1;
+
 			nbio_jobs.fdin_used--;
 			found = true;
 			break;
@@ -72,6 +78,8 @@ static bool nbio_dequeue(int fd, mode_t mode, intptr_t* tag)
 				&nbio_jobs.fdout[i+1],
 				(nbio_jobs.fdout_used - i) * sizeof(struct pollfd)
 			);
+			nbio_jobs.fdout_tags[i+1] = LUA_NOREF;
+			nbio_jobs.fdout[i+1] = (struct pollfd){.fd = -1};
 
 			found = true;
 			break;
@@ -90,21 +98,23 @@ static bool nbio_queue(int fd, mode_t mode, intptr_t tag)
 /* need to split read/write so we can use the regular tui multiplex as well as
  * mix in our own pollset */
 	if (mode == O_RDONLY){
-		if (nbio_jobs.fdin_used >= LIMIT_JOBS)
+		if (nbio_jobs.fdin_used >= LIMIT_JOBS-1)
 			return false;
 
 		nbio_jobs.fdin[nbio_jobs.fdin_used] = fd;
 		nbio_jobs.fdin_tags[nbio_jobs.fdin_used] = tag;
+
 		nbio_jobs.fdin_used++;
 	}
 
 	if (mode == O_WRONLY){
-		if (nbio_jobs.fdout_used >= LIMIT_JOBS)
+		if (nbio_jobs.fdout_used >= LIMIT_JOBS-1)
 			return false;
 
 		nbio_jobs.fdout[nbio_jobs.fdout_used].fd = fd;
 		nbio_jobs.fdout[nbio_jobs.fdout_used].events = POLLOUT | POLLERR | POLLHUP;
 		nbio_jobs.fdout_tags[nbio_jobs.fdout_used] = tag;
+
 		nbio_jobs.fdout_used++;
 	}
 

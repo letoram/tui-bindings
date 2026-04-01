@@ -861,6 +861,16 @@ instead swap handler with another data\_handler call. The reason that the
 default behaviour is to drop the callback after firing is to prevent a
 live-/spin if you happen to ignore reading from the source when there is data.
 
+Other open modes are 'fifo-in' for creating a named FIFO, 'unix' for a domain
+socket and 'fd-in'/'fd-out' for binding an existing/inherited descriptor.
+
+The domain socket is special in that the returned object only exposes 'accept'
+and 'close'. Accept is used to accept a pending connection and returns an I/O
+stream with the same methods as a normal fopen request would.
+
+The 'fd-in' / 'fd-out' modes take an additional number argument for the
+descriptor to wrap around the input handler object.
+
 This is optimised for interactivity, not for throughput. The data handler will
 be invoked as part of the normal :process() part of the event loop when there
 is data to be read or written.

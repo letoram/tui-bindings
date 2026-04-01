@@ -359,7 +359,7 @@ int alt_nbio_close(lua_State* L, struct nonblock_io** ibb)
 	}
 
 /* no-op if nothing registered */
-	intptr_t tag;
+	intptr_t tag = -1;
 	if (remove_job(fd, O_RDONLY, &tag)){
 		unref_registry(L, tag, LUA_TUSERDATA, "nbio_close_rdmeta");
 	}
@@ -900,18 +900,6 @@ int alt_nbio_process_read(
 		lua_pushboolean(L, !eof);
 		return 2;
 	}
-}
-
-lua_Number luaL_checkbnumber(lua_State* L, int narg)
-{
-	lua_Number d = lua_tonumber(L, narg);
-	if (d == 0 && !lua_isnumber(L, narg)){
-		if (!lua_isboolean(L, narg))
-			luaL_argerror(L, narg, "number or boolean");
-		else
-			d = lua_toboolean(L, narg);
-	}
-	return d;
 }
 
 static int nbio_lf(lua_State* L)

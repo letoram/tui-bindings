@@ -27,6 +27,7 @@ void arcan_random(uint8_t* dst, size_t sz);
 #include <string.h>
 #include <strings.h>
 #include <poll.h>
+#include <inttypes.h>
 
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -152,7 +153,6 @@ static void dump_stack(lua_State* ctx)
 	fprintf(stderr, "-- stack dump (%d)--\n", top);
 
 	for (size_t i = 1; i <= top; i++){
-		int t = lua_type(ctx, i);
 		dump_ltop(ctx, i);
 	}
 
@@ -394,6 +394,16 @@ static bool on_u8(struct tui_context* T, const char* u8, size_t len, void* t)
 		lua_pop(L, 1);
 	END_HREF;
 	return rv;
+}
+
+static void on_message(
+	struct tui_context* T, const uint8_t* msg, bool cont, void* t)
+{
+	SETUP_HREF("message",);
+		lua_pushstring(L, (const char*) msg);
+		lua_pushboolean(L, cont);
+		RUN_CALLBACK("message", 2, 0);
+	END_HREF;
 }
 
 static void on_mouse(struct tui_context* T,
@@ -924,7 +934,6 @@ static void on_readline_suggest_item(
 		LUA_REGISTRYINDEX, meta->widget_meta->readline.item);
 	lua_rawgeti(meta->lua, LUA_REGISTRYINDEX, meta->widget_state);
 
-	ssize_t res = -1;
 /* function(self, prefix, full, suggest) -> offset or accept/reject */
 	lua_pushstring(L, item);
 	lua_pushstring(L, hint);
@@ -1599,6 +1608,7 @@ ltui_inherit(lua_State* L, arcan_tui_conn* conn, struct tui_lmeta* T)
 		.cli_command = on_cli_command,
 		.seek_absolute = on_seek_absolute,
 		.seek_relative = on_seek_relative,
+		.message = on_message,
 		.tag = meta
 	};
 	meta->href = LUA_NOREF;
@@ -1966,11 +1976,19 @@ static int process(lua_State* L)
 	TUI_UDATA;
 
 	int timeout = luaL_optnumber(L, 2, -1);
+	struct arcan_shmif_cont* C = arcan_tui_acon(ib->tui);
 	struct tui_process_res res;
 
 repoll:
-	res = arcan_tui_process(
-		ib->subs, ib->n_subs+1, nbio_jobs.fdin, nbio_jobs.fdin_used, timeout);
+/* +1 in that there is always a primary, but the primary can be hollow (without
+ * a display connection), if so we special case it. This is different from the
+ * tui-lua bindings distributed with arcan. */
+	if (!C->addr){
+		res = arcan_tui_process(NULL, 0, nbio_jobs.fdin, nbio_jobs.fdin_used, timeout);
+	}
+	else
+		res = arcan_tui_process(
+			ib->subs, ib->n_subs+1, nbio_jobs.fdin, nbio_jobs.fdin_used, timeout);
 
 /* if there are bad contexts, the descriptors won't get their time */
 	if (res.errc == TUI_ERRC_BAD_CTX){
@@ -2175,6 +2193,26 @@ static int alert(lua_State* L)
 {
 	TUI_UDATA;
 	arcan_tui_message(ib->tui, TUI_MESSAGE_ALERT, luaL_checkstring(L, 2));
+	return 0;
+}
+
+static int message(lua_State* L)
+{
+	TUI_UDATA;
+	int ind = 2;
+	struct tui_lmeta* db = ib;
+	int msgtype = TUI_MESSAGE_GENERIC;
+
+	if (lua_type(L, 2) == LUA_TUSERDATA){
+		db = luaL_checkudata(L, 2, TUI_METATABLE);
+		if (!db || !db->tui){
+			luaL_error(L, !db ? "no userdata" : "userdata isn't a tui context");
+		}
+		msgtype = TUI_MESSAGE_LOCAL;
+		ind++;
+	}
+
+	arcan_tui_message(db->tui, msgtype, luaL_checkstring(L, ind));
 	return 0;
 }
 
@@ -3452,11 +3490,11 @@ static int tui_fopen(lua_State* L)
 {
 	TUI_UDATA;
 
-	const char* name = luaL_checkstring(L, 2);
 	const char* mode = luaL_optstring(L, 3, "r");
 	mode_t omode = O_RDONLY;
 	int flags = 0;
 
+	const char* name = luaL_checkstring(L, 2);
 	if (strcmp(mode, "r") == 0)
 		omode = O_RDONLY;
 	else if (strcmp(mode, "w") == 0){
@@ -3483,8 +3521,17 @@ static int tui_fopen(lua_State* L)
 		lua_pushstring(L, strerror(errno));
 		return 2;
 	}
+	else if (strcmp(mode, "fd-in") == 0){
+		alt_nbio_import(L, luaL_checknumber(L, 4), O_RDONLY, NULL, NULL);
+		return 1;
+	}
+	else if (strcmp(mode, "fd-out") == 0){
+		alt_nbio_import(L, luaL_checknumber(L, 4), O_WRONLY, NULL, NULL);
+		return 1;
+	}
 	else
-		luaL_error(L, "unsupported file mode, expected 'r', 'w' or 'unix'");
+		luaL_error(L, "unsupported file mode, expected "
+			"'r', 'w', 'fifo-in', 'fd-in', 'fd-out' or 'unix'");
 
 	int	fd = openat(ib->cwd_fd, name, omode | flags, 0600);
 
@@ -3738,6 +3785,7 @@ static void register_tuimeta(lua_State* L)
 		{"request_io", request_io},
 		{"announce_cursor_io", announce_cursor_io},
 		{"alert", alert},
+		{"message", message},
 		{"notification", notification},
 		{"failure", failure},
 		{"state_size", statesize},
